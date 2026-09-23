@@ -339,6 +339,114 @@ static long banded_distance(const uint32_t *a, size_t n, const uint32_t *b, size
     return result;
 }
 
+/*
+ * Myers (1999) 位元平行 Levenshtein，Hyyrö 的多字組 (block) 版本 (與 edlib 相同的公式)：
+ * 把較短的一邊 (pattern，長 m) 切成每 64 列一個 64 位元字組，對較長的一邊 (text) 每個字元
+ * 只做幾個位元運算就更新一整個字組，成本 O(n × ⌈m/64⌉)，結果與完整動態規劃完全相同。
+ *   Pv / Mv：垂直差分 (+1 / −1) 的位元向量；Ph / Mh：水平差分；Eq：pattern 各列是否等於目前字元。
+ * 回傳距離；記憶體不足或超出預算回傳 -1 (改走其他方法)。
+ */
+#define MYERS_WORD 64
+#define MYERS_MAX_PATTERN (1u << 21)           /* pattern 超過 200 萬字就不用 (雜湊表太大) */
+#define MYERS_PEQ_MEMORY (128.0 * 1024 * 1024) /* Peq 表上限 */
+#define MYERS_WORK_BUDGET 2.0e9                /* n × 字組數 的上限 (約 2～4 秒) */
+
+typedef struct {
+    uint32_t key;
+    int32_t idx; /* -1 = 空 */
+} PeqSlot;
+
+/* 字元 -> Peq 列編號；insert = 0 時找不到回傳 -1 */
+static int peq_index(PeqSlot *table, size_t mask, uint32_t c, int insert, int *count)
+{
+    size_t h = (size_t)(c * 2654435761u) & mask;
+    for (;;) {
+        if (table[h].idx < 0) {
+            if (!insert)
+                return -1;
+            table[h].key = c;
+            table[h].idx = (*count)++;
+            return table[h].idx;
+        }
+        if (table[h].key == c)
+            return table[h].idx;
+        h = (h + 1) & mask;
+    }
+}
+
+static long myers_distance(const uint32_t *text, size_t n, const uint32_t *pat, size_t m)
+{
+    size_t blocks = (m + MYERS_WORD - 1) / MYERS_WORD, table_size = 16, mask, i, j, b;
+    PeqSlot *table;
+    uint64_t *peq, *pv, *mv, last_bit;
+    int distinct = 0;
+    long score = (long)m;
+
+    if (m == 0 || m > MYERS_MAX_PATTERN || (double)n * (double)blocks > MYERS_WORK_BUDGET)
+        return -1;
+    while (table_size < 2 * m + 2)
+        table_size <<= 1;
+    mask = table_size - 1;
+    table = malloc(table_size * sizeof(PeqSlot));
+    if (table == NULL)
+        return -1;
+    for (i = 0; i < table_size; i++)
+        table[i].idx = -1;
+    for (i = 0; i < m; i++)
+        peq_index(table, mask, pat[i], 1, &distinct);
+    if ((double)distinct * (double)blocks * sizeof(uint64_t) > MYERS_PEQ_MEMORY) {
+        free(table);
+        return -1;
+    }
+    peq = calloc((size_t)distinct * blocks, sizeof(uint64_t));
+    pv = malloc(blocks * sizeof(uint64_t));
+    mv = calloc(blocks, sizeof(uint64_t));
+    if (peq == NULL || pv == NULL || mv == NULL) {
+        free(table); free(peq); free(pv); free(mv);
+        return -1;
+    }
+    for (i = 0; i < m; i++)
+        peq[(size_t)peq_index(table, mask, pat[i], 0, &distinct) * blocks + i / MYERS_WORD] |=
+            (uint64_t)1 << (i % MYERS_WORD);
+    for (b = 0; b < blocks; b++)
+        pv[b] = ~(uint64_t)0;
+    last_bit = (uint64_t)1 << ((m - 1) % MYERS_WORD); /* pattern 最後一列 (最後一個字組裡多出來的列不影響它) */
+
+    for (j = 0; j < n; j++) {
+        int idx = peq_index(table, mask, text[j], 0, &distinct);
+        const uint64_t *row = idx >= 0 ? peq + (size_t)idx * blocks : NULL;
+        int hin = 1; /* 第 0 列的水平差分是 +1 (D[0][j] = j) */
+        for (b = 0; b < blocks; b++) {
+            uint64_t eq = row != NULL ? row[b] : 0, xv, xh, ph, mh;
+            uint64_t hin_neg = hin < 0 ? 1 : 0;
+            int hout;
+            xv = eq | mv[b];
+            eq |= hin_neg;
+            xh = (((eq & pv[b]) + pv[b]) ^ pv[b]) | eq;
+            ph = mv[b] | ~(xh | pv[b]);
+            mh = pv[b] & xh;
+            if (b == blocks - 1) {
+                if (ph & last_bit)
+                    score++;
+                else if (mh & last_bit)
+                    score--;
+            }
+            hout = (int)(ph >> (MYERS_WORD - 1)) - (int)(mh >> (MYERS_WORD - 1));
+            ph <<= 1;
+            mh <<= 1;
+            if (hin_neg)
+                mh |= 1;
+            else if (hin > 0)
+                ph |= 1;
+            pv[b] = mh | ~(xv | ph);
+            mv[b] = ph & xv;
+            hin = hout;
+        }
+    }
+    free(table); free(peq); free(pv); free(mv);
+    return score;
+}
+
 static long edit_distance(const uint32_t *a, size_t n, const uint32_t *b, size_t m, int *approximate)
 {
     size_t i, shorter, longer;
@@ -365,6 +473,16 @@ static long edit_distance(const uint32_t *a, size_t n, const uint32_t *b, size_t
     }
     shorter = m;
     longer = n;
+
+    /* 很短的就用最簡單的動態規劃；其他先用 Myers 位元平行 (精確、快幾十倍) */
+    if ((double)n * (double)m <= 4096.0) {
+        diff = full_distance(a, n, b, m);
+        if (diff >= 0)
+            return diff;
+    }
+    diff = myers_distance(a, n, b, m);
+    if (diff >= 0)
+        return diff;
 
     if ((double)n * (double)m <= EDIT_DISTANCE_CELL_LIMIT) {
         diff = full_distance(a, n, b, m);

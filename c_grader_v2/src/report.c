@@ -9,7 +9,7 @@
 #include "report.h"
 
 /* 標示差異位置需要 n x m 的表格；超過這個大小就不標示 (差異數仍照常計算) */
-#define HIGHLIGHT_CELL_LIMIT 3000000.0
+#define HIGHLIGHT_CELL_LIMIT 8000000.0
 #define INPUT_SHOW_LIMIT (16 * 1024)
 
 /* ---------------- 小工具 ---------------- */
@@ -68,16 +68,123 @@ static void marked_free(MarkedText *t)
     t->mark = NULL;
 }
 
+/* ---------------- 差異腳本 (diff-match-patch 風格) ---------------- */
+
+/* 一段差異：0 = 相同、-1 = 只在標準答案 (學生少了/寫錯)、+1 = 只在學生輸出 (多出來/寫錯) */
+typedef struct {
+    signed char op;
+    size_t len;
+} DiffOp;
+
+typedef struct {
+    DiffOp *items;
+    size_t count, cap;
+} DiffList;
+
+static void diff_push(DiffList *d, int op, size_t len)
+{
+    if (len == 0)
+        return;
+    if (d->count > 0 && d->items[d->count - 1].op == op) {
+        d->items[d->count - 1].len += len;
+        return;
+    }
+    if (d->count == d->cap) {
+        size_t cap = d->cap > 0 ? d->cap * 2 : 64;
+        DiffOp *p = realloc(d->items, cap * sizeof(DiffOp));
+        if (p == NULL)
+            return;
+        d->items = p;
+        d->cap = cap;
+    }
+    d->items[d->count].op = (signed char)op;
+    d->items[d->count].len = len;
+    d->count++;
+}
+
+static void diff_free(DiffList *d)
+{
+    free(d->items);
+    d->items = NULL;
+    d->count = d->cap = 0;
+}
+
+/* 把「刪、插、刪、插…」交錯的一段整理成「一段刪除 + 一段插入」，相同段合併 (同 diff-match-patch 的 cleanupMerge) */
+static void diff_normalize(DiffList *d)
+{
+    DiffList out = {0};
+    size_t i, del = 0, ins = 0;
+
+    for (i = 0; i <= d->count; i++) {
+        if (i == d->count || d->items[i].op == 0) {
+            diff_push(&out, -1, del);
+            diff_push(&out, 1, ins);
+            del = ins = 0;
+            if (i < d->count)
+                diff_push(&out, 0, d->items[i].len);
+        } else if (d->items[i].op < 0) {
+            del += d->items[i].len;
+        } else {
+            ins += d->items[i].len;
+        }
+    }
+    diff_free(d);
+    *d = out;
+}
+
 /*
- * 用編輯距離的回溯找出哪些字元不同：
- *   標準答案那邊被標示 = 學生少了或寫錯的字；學生那邊被標示 = 多出來或寫錯的字。
- * 回傳 0 表示太長沒有標示。
+ * 語意清理 (同 diff-match-patch 的 cleanupSemantic)：夾在兩段修改中間、又比前後修改都短的「相同」小碎片，
+ * 併進修改裡；例如 Avg vs Average 原本是「Av + 插 era + g + 插 e」，清理後是「Av + 刪 g + 插 erage」，
+ * 老師一眼就看出是整個字不一樣，而不是散落的單字。
  */
-static int mark_differences(MarkedText *a, MarkedText *b)
+static void diff_cleanup_semantic(DiffList *d)
+{
+    int changed = 1, rounds = 0;
+
+    while (changed && rounds++ < 64) {
+        size_t k;
+        changed = 0;
+        for (k = 1; k + 1 < d->count && !changed; k++) {
+            size_t before = 0, after = 0, i, eq_len = d->items[k].len;
+            DiffList out = {0};
+            if (d->items[k].op != 0 || eq_len > 12)
+                continue;
+            for (i = k; i-- > 0 && d->items[i].op != 0;)
+                if (d->items[i].len > before)
+                    before = d->items[i].len;
+            for (i = k + 1; i < d->count && d->items[i].op != 0; i++)
+                if (d->items[i].len > after)
+                    after = d->items[i].len;
+            if (before == 0 || after == 0 || eq_len > before || eq_len > after)
+                continue;
+            /* 這段相同文字改成「刪掉再插入」，normalize 會把它併進前後的修改 */
+            for (i = 0; i < d->count; i++) {
+                if (i == k) {
+                    diff_push(&out, -1, eq_len);
+                    diff_push(&out, 1, eq_len);
+                } else {
+                    diff_push(&out, d->items[i].op, d->items[i].len);
+                }
+            }
+            diff_free(d);
+            *d = out;
+            diff_normalize(d);
+            changed = 1;
+        }
+    }
+}
+
+/*
+ * 用編輯距離的回溯算出差異腳本 (相同 / 學生少了 / 學生多了)，並做語意清理。
+ * 回傳 0 表示太長沒有算 (差異數仍照常計算)。
+ */
+static int diff_compute(const MarkedText *a, const MarkedText *b, DiffList *out)
 {
     size_t pre = 0, suf = 0, n, m, i, j;
     int32_t *d;
+    DiffList rev = {0};
 
+    memset(out, 0, sizeof(*out));
     while (pre < a->len && pre < b->len && a->ch[pre] == b->ch[pre])
         pre++;
     while (suf < a->len - pre && suf < b->len - pre && a->ch[a->len - 1 - suf] == b->ch[b->len - 1 - suf])
@@ -85,52 +192,85 @@ static int mark_differences(MarkedText *a, MarkedText *b)
     n = a->len - pre - suf;
     m = b->len - pre - suf;
 
-    if (n == 0 || m == 0) {
-        for (i = 0; i < n; i++)
-            a->mark[pre + i] = 1;
-        for (j = 0; j < m; j++)
-            b->mark[pre + j] = 1;
-        return 1;
-    }
-    if ((double)(n + 1) * (double)(m + 1) > HIGHLIGHT_CELL_LIMIT)
-        return 0;
-
-    d = malloc((n + 1) * (m + 1) * sizeof(int32_t));
-    if (d == NULL)
-        return 0;
+    if (n > 0 && m > 0) {
+        if ((double)(n + 1) * (double)(m + 1) > HIGHLIGHT_CELL_LIMIT)
+            return 0;
+        d = malloc((n + 1) * (m + 1) * sizeof(int32_t));
+        if (d == NULL)
+            return 0;
 #define D(x, y) d[(x) * (m + 1) + (y)]
-    for (i = 0; i <= n; i++)
-        D(i, 0) = (int32_t)i;
-    for (j = 0; j <= m; j++)
-        D(0, j) = (int32_t)j;
-    for (i = 1; i <= n; i++) {
-        for (j = 1; j <= m; j++) {
-            int32_t best = D(i - 1, j - 1) + (a->ch[pre + i - 1] != b->ch[pre + j - 1]);
-            if (D(i - 1, j) + 1 < best)
-                best = D(i - 1, j) + 1;
-            if (D(i, j - 1) + 1 < best)
-                best = D(i, j - 1) + 1;
-            D(i, j) = best;
+        for (i = 0; i <= n; i++)
+            D(i, 0) = (int32_t)i;
+        for (j = 0; j <= m; j++)
+            D(0, j) = (int32_t)j;
+        for (i = 1; i <= n; i++) {
+            for (j = 1; j <= m; j++) {
+                int32_t best = D(i - 1, j - 1) + (a->ch[pre + i - 1] != b->ch[pre + j - 1]);
+                if (D(i - 1, j) + 1 < best)
+                    best = D(i - 1, j) + 1;
+                if (D(i, j - 1) + 1 < best)
+                    best = D(i, j - 1) + 1;
+                D(i, j) = best;
+            }
         }
-    }
-    i = n;
-    j = m;
-    while (i > 0 || j > 0) {
-        if (i > 0 && j > 0 && a->ch[pre + i - 1] == b->ch[pre + j - 1] && D(i, j) == D(i - 1, j - 1)) {
-            i--;
-            j--;
-        } else if (i > 0 && j > 0 && D(i, j) == D(i - 1, j - 1) + 1) {
-            a->mark[pre + --i] = 1;
-            b->mark[pre + --j] = 1;
-        } else if (i > 0 && D(i, j) == D(i - 1, j) + 1) {
-            a->mark[pre + --i] = 1;
-        } else {
-            b->mark[pre + --j] = 1;
+        /* 從右下角回溯 (得到的是反向順序) */
+        i = n;
+        j = m;
+        while (i > 0 || j > 0) {
+            if (i > 0 && j > 0 && a->ch[pre + i - 1] == b->ch[pre + j - 1] && D(i, j) == D(i - 1, j - 1)) {
+                diff_push(&rev, 0, 1);
+                i--;
+                j--;
+            } else if (i > 0 && j > 0 && D(i, j) == D(i - 1, j - 1) + 1) {
+                diff_push(&rev, 1, 1); /* 反向：先插後刪，正向就是先刪後插 */
+                diff_push(&rev, -1, 1);
+                i--;
+                j--;
+            } else if (i > 0 && D(i, j) == D(i - 1, j) + 1) {
+                diff_push(&rev, -1, 1);
+                i--;
+            } else {
+                diff_push(&rev, 1, 1);
+                j--;
+            }
         }
-    }
 #undef D
-    free(d);
+        free(d);
+    }
+
+    diff_push(out, 0, pre);
+    if (n > 0 && m > 0) {
+        for (i = rev.count; i-- > 0;)
+            diff_push(out, rev.items[i].op, rev.items[i].len);
+    } else {
+        diff_push(out, -1, n);
+        diff_push(out, 1, m);
+    }
+    diff_push(out, 0, suf);
+    diff_free(&rev);
+    diff_normalize(out);
+    diff_cleanup_semantic(out);
     return 1;
+}
+
+/* 依差異腳本標記兩邊的字元 (給左右對照用) */
+static void diff_apply_marks(const DiffList *d, MarkedText *a, MarkedText *b)
+{
+    size_t k, i = 0, j = 0, t;
+
+    for (k = 0; k < d->count; k++) {
+        const DiffOp *op = &d->items[k];
+        if (op->op == 0) {
+            i += op->len;
+            j += op->len;
+        } else if (op->op < 0) {
+            for (t = 0; t < op->len && i < a->len; t++)
+                a->mark[i++] = 1;
+        } else {
+            for (t = 0; t < op->len && j < b->len; t++)
+                b->mark[j++] = 1;
+        }
+    }
 }
 
 static void append_codepoint(StrBuf *sb, uint32_t c)
@@ -204,6 +344,92 @@ static void render_marked(StrBuf *sb, const MarkedText *t, const char *cls)
     }
     if (open)
         sb_append(sb, "</mark>");
+}
+
+/* 一段被標示的文字：空白/Tab/換行顯示成符號；換行後把標籤關掉再重開，行的結構才看得到 */
+static void render_segment(StrBuf *sb, const uint32_t *ch, size_t len, const char *tag)
+{
+    size_t i;
+    int open = 0;
+
+    for (i = 0; i < len; i++) {
+        if (!open) {
+            sb_appendf(sb, "<%s>", tag);
+            open = 1;
+        }
+        if (ch[i] == ' ')
+            sb_append(sb, "\xC2\xB7");
+        else if (ch[i] == '\t')
+            sb_append(sb, "\xE2\x86\x92");
+        else if (ch[i] == '\n') {
+            sb_appendf(sb, "\xE2\x86\xB5</%s>\n", tag);
+            open = 0;
+        } else
+            append_codepoint(sb, ch[i]);
+    }
+    if (open)
+        sb_appendf(sb, "</%s>", tag);
+}
+
+/* 合併檢視 (diff-match-patch 的 prettyHtml)：一份文字裡同時看到刪除線 (學生少了) 與綠底 (學生多了) */
+static void render_inline(StrBuf *sb, const MarkedText *a, const MarkedText *b, const DiffList *d)
+{
+    size_t k, i = 0, j = 0, t;
+
+    for (k = 0; k < d->count; k++) {
+        const DiffOp *op = &d->items[k];
+        if (op->op == 0) {
+            for (t = 0; t < op->len; t++)
+                append_codepoint(sb, a->ch[i + t]);
+            i += op->len;
+            j += op->len;
+        } else if (op->op < 0) {
+            render_segment(sb, a->ch + i, op->len, "del");
+            i += op->len;
+        } else {
+            render_segment(sb, b->ch + j, op->len, "ins");
+            j += op->len;
+        }
+    }
+}
+
+/*
+ * 兩段文字的完整比對呈現：先是合併檢視，再是左右對照 (同一份差異腳本)。
+ * a = 標準答案 / 原始碼，b = 學生輸出 / 修正後。b_missing = 1 表示學生沒有輸出。回傳 1 = 有標示。
+ */
+static int render_diff_views(StrBuf *sb, MarkedText *a, MarkedText *b, const char *label_a, const char *label_b,
+                             const char *note_a, const char *note_b, int b_missing, int identical)
+{
+    DiffList d = {0};
+    int marked = 0;
+
+    if (!identical && a->ch != NULL && b->ch != NULL && !b_missing)
+        marked = diff_compute(a, b, &d);
+    if (marked)
+        diff_apply_marks(&d, a, b);
+
+    if (marked && !identical) {
+        sb_append(sb, "<details open><summary>合併檢視 (一份文字看完所有差異)</summary><pre class=inline>");
+        render_inline(sb, a, b, &d);
+        sb_append(sb, "</pre></details>");
+    }
+    sb_appendf(sb, "<div class=grid><div><b>%s</b><pre>", label_a);
+    if (a->ch != NULL)
+        render_marked(sb, a, "miss");
+    if (note_a != NULL)
+        sb_append(sb, note_a);
+    sb_appendf(sb, "</pre></div><div><b>%s</b><pre>", label_b);
+    if (b_missing)
+        sb_append(sb, "(沒有輸出)");
+    else if (b->ch != NULL)
+        render_marked(sb, b, "extra");
+    if (note_b != NULL)
+        sb_append(sb, note_b);
+    sb_append(sb, "</pre></div></div>");
+    if (!marked && !identical && !b_missing)
+        sb_append(sb, "<p class=muted>輸出太長，未標示差異位置 (差異數仍已計算)。</p>");
+    diff_free(&d);
+    return marked;
 }
 
 /* ---------------- 設定說明 ---------------- */
@@ -299,6 +525,9 @@ static const char *STYLE =
     "white-space:pre;line-height:1.45}"
     "pre.src{max-height:640px}"
     "mark.miss{background:#ffc9c9;color:#8a0000;text-decoration:line-through}"
+    "pre.inline{max-height:560px;line-height:1.6}"
+    "pre.inline del{background:#ffd3d3;color:#8a0000;text-decoration:line-through;border-radius:3px;padding:0 1px}"
+    "pre.inline ins{background:#c9f2c9;color:#0b5a0b;text-decoration:none;border-radius:3px;padding:0 1px}"
     "mark.extra{background:#c4f0c4;color:#0b5a0b}"
     ".legend mark{padding:0 4px}"
     "pre.code{counter-reset:line}pre.code span{display:block}"
@@ -413,16 +642,9 @@ static void append_fix_section(StrBuf *sb, const StudentResult *r)
 
     decode(orig != NULL ? orig : "", orig != NULL ? orig_len : 0, &a);
     decode(r->fixed_source, strlen(r->fixed_source), &b);
-    marked = a.ch != NULL && b.ch != NULL ? mark_differences(&a, &b) : 0;
     sb_append(sb, "<p class='muted legend'>標示說明：<mark class=miss>紅色刪除線</mark> = 原始碼中被 AI 刪除或改掉的字；"
                   "<mark class=extra>綠色</mark> = AI 新增或改成的字。空白顯示為 ·、Tab 為 →、換行為 ↵。</p>");
-    sb_append(sb, "<div class=grid><div><b>學生原始碼</b><pre class=src>");
-    if (a.ch != NULL)
-        render_marked(sb, &a, "miss");
-    sb_append(sb, "</pre></div><div><b>AI 修正後</b><pre class=src>");
-    if (b.ch != NULL)
-        render_marked(sb, &b, "extra");
-    sb_append(sb, "</pre></div></div>");
+    marked = render_diff_views(sb, &a, &b, "學生原始碼", "AI 修正後", NULL, NULL, 0, 0);
     if (!marked)
         sb_append(sb, "<p class=muted>程式太長，未標示差異位置。</p>");
     if (r->fix_log != NULL && r->fix_log[0] != '\0') {
@@ -562,7 +784,6 @@ int report_write_student(const char *report_dir, const Grader *g, const StudentR
             size_t in_len = 0, exp_len = g->expected_len[i];
             char *input = read_file(g->tests.items[i].in_path, &in_len);
             MarkedText e, a;
-            int marked;
 
             if (exp_len > OUTPUT_PREVIEW_LIMIT)
                 exp_len = OUTPUT_PREVIEW_LIMIT;
@@ -612,23 +833,10 @@ int report_write_student(const char *report_dir, const Grader *g, const StudentR
 
             decode(g->expected[i], exp_len, &e);
             decode(t->actual != NULL ? t->actual : "", t->actual != NULL ? t->actual_len : 0, &a);
-            marked = t->diff != 0 && e.ch != NULL && a.ch != NULL ? mark_differences(&e, &a) : 1;
-
-            sb_append(&sb, "<div class=grid><div><b>標準答案 (Expected)</b><pre>");
-            if (e.ch != NULL)
-                render_marked(&sb, &e, "miss");
-            if (g->expected_len[i] > OUTPUT_PREVIEW_LIMIT)
-                sb_append(&sb, "\n…(太長，只顯示前 64 KB)");
-            sb_append(&sb, "</pre></div><div><b>學生輸出 (Actual)</b><pre>");
-            if (t->actual == NULL)
-                sb_append(&sb, "(沒有輸出)");
-            else if (a.ch != NULL)
-                render_marked(&sb, &a, "extra");
-            if (t->actual_truncated)
-                sb_append(&sb, "\n…(輸出太長，只顯示前 64 KB)");
-            sb_append(&sb, "</pre></div></div>");
-            if (!marked)
-                sb_append(&sb, "<p class=muted>輸出太長，未標示差異位置 (差異數仍已計算)。</p>");
+            render_diff_views(&sb, &e, &a, "標準答案 (Expected)", "學生輸出 (Actual)",
+                              g->expected_len[i] > OUTPUT_PREVIEW_LIMIT ? "\n…(太長，只顯示前 64 KB)" : NULL,
+                              t->actual_truncated ? "\n…(輸出太長，只顯示前 64 KB)" : NULL, t->actual == NULL,
+                              t->diff == 0);
             marked_free(&e);
             marked_free(&a);
             sb_append(&sb, "</div>");

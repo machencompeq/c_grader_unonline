@@ -163,7 +163,7 @@ static void test_long_outputs(void)
     free(a);
     free(b);
 
-    /* 超長且完全不同：超過工作量預算才退回近似值，並且要標記 approximate */
+    /* 超長且完全不同 (12 萬 x 12 萬 = 144 億格)：Myers 位元平行仍給精確值，不必近似 */
     {
         const size_t big = 120000;
         char *x = malloc(big + 1), *y = malloc(big + 1);
@@ -173,9 +173,108 @@ static void test_long_outputs(void)
         approx = 0;
         d = compare_outputs(x, big, y, big, &o, &approx);
         CHECK_LONG(d, (long)big);
-        CHECK_LONG(approx, 1);
+        CHECK_LONG(approx, 0);
         free(x);
         free(y);
+    }
+}
+
+/* 教科書版動態規劃 (以字元陣列)，用來驗證 Myers 位元平行 / 帶狀演算法 */
+static long naive_distance(const uint32_t *a, size_t n, const uint32_t *b, size_t m)
+{
+    long *prev = malloc((m + 1) * sizeof(long)), *cur = malloc((m + 1) * sizeof(long)), result;
+    size_t i, j;
+    for (j = 0; j <= m; j++)
+        prev[j] = (long)j;
+    for (i = 1; i <= n; i++) {
+        cur[0] = (long)i;
+        for (j = 1; j <= m; j++) {
+            long best = prev[j - 1] + (a[i - 1] != b[j - 1]);
+            if (prev[j] + 1 < best)
+                best = prev[j] + 1;
+            if (cur[j - 1] + 1 < best)
+                best = cur[j - 1] + 1;
+            cur[j] = best;
+        }
+        memcpy(prev, cur, (m + 1) * sizeof(long));
+    }
+    result = prev[m];
+    free(prev);
+    free(cur);
+    return result;
+}
+
+static unsigned rng_state = 20260923u;
+static unsigned rng(void)
+{
+    rng_state = rng_state * 1664525u + 1013904223u;
+    return rng_state >> 8;
+}
+
+/* 隨機字串 (英文 + 中文) 與教科書版比對：長度跨越 1 個到多個 64 位元字組 */
+static void test_myers_random(void)
+{
+    static const char *alphabet[] = {"a", "b", "c", "d", "系", "所", "\xE8\xB3\x87", " "};
+    int round, mismatches = 0;
+
+    for (round = 0; round < 600; round++) {
+        size_t max_len = round < 200 ? 24 : round < 400 ? 200 : 700, la = rng() % (max_len + 1), lb = rng() % (max_len + 1);
+        int letters = 2 + (int)(rng() % 7), i;
+        StrBuf sa = {0}, sb = {0};
+        uint32_t *ca, *cb;
+        size_t na, nb;
+        long got, want;
+        int approx = 0;
+        CompareOptions o;
+
+        for (i = 0; i < (int)la; i++)
+            sb_append(&sa, alphabet[rng() % letters]);
+        for (i = 0; i < (int)lb; i++)
+            sb_append(&sb, alphabet[rng() % letters]);
+        ca = malloc((sa.len + 1) * sizeof(uint32_t));
+        cb = malloc((sb.len + 1) * sizeof(uint32_t));
+        na = compare_decode_utf8((const unsigned char *)(sa.data != NULL ? sa.data : ""), sa.len, ca);
+        nb = compare_decode_utf8((const unsigned char *)(sb.data != NULL ? sb.data : ""), sb.len, cb);
+        want = naive_distance(ca, na, cb, nb);
+        compare_options_default(&o);
+        got = compare_outputs(sa.data != NULL ? sa.data : "", sa.len, sb.data != NULL ? sb.data : "", sb.len, &o, &approx);
+        checks++;
+        if (got != want || approx) {
+            if (mismatches++ < 5)
+                printf("FAIL myers round %d: got %ld want %ld (len %zu/%zu, approx %d)\n", round, got, want, na, nb, approx);
+            failures++;
+        }
+        free(ca);
+        free(cb);
+        sb_free(&sa);
+        sb_free(&sb);
+    }
+
+    /* 大一點的 (25M 格)：Myers 與教科書版一致 */
+    {
+        const size_t n = 5000;
+        uint32_t *a = malloc(n * sizeof(uint32_t)), *b = malloc(n * sizeof(uint32_t));
+        StrBuf sa = {0}, sb = {0};
+        size_t i;
+        int approx = 0;
+        CompareOptions o;
+        compare_options_default(&o);
+        for (i = 0; i < n; i++) {
+            a[i] = 'a' + rng() % 4;
+            b[i] = 'a' + rng() % 4;
+        }
+        for (i = 0; i < n; i++) {
+            char c = (char)a[i];
+            sb_append_len(&sa, &c, 1);
+            c = (char)b[i];
+            sb_append_len(&sb, &c, 1);
+        }
+        CHECK_LONG(compare_outputs(sa.data, sa.len, sb.data, sb.len, &o, &approx), naive_distance(a, n, b, n));
+        CHECK_LONG(approx, 0);
+        free(a);
+        free(b);
+        sb_free(&sa);
+        sb_free(&sb);
     }
 }
 
@@ -652,6 +751,7 @@ int main(void)
     SetConsoleOutputCP(CP_UTF8);
     test_comparator();
     test_long_outputs();
+    test_myers_random();
     test_per_char();
     test_per_n_char();
     test_range();

@@ -56,6 +56,8 @@ StudentResult[] ─► 畫面表格、學生詳細、reports\*.html、result.csv
 
 ## 3. 差異數 (comparator.c)
 
+完整說明 (含例子與演算法論證) 見 [COMPARATOR.md](COMPARATOR.md)。
+
 1. 讀檔 → 去 UTF-8 BOM → `\r\n` 視為 `\n` → 以 **Unicode 字元**為單位 (中文字 = 1 CHAR；不合法的 byte 各算 1 CHAR)
 2. 比對選項：全形轉半形、忽略大小寫 → 逐行：去行尾空白 (含 Tab、全形空白)、刪空白行、刪含關鍵字的行
 3. 比對模式：Strict 不動／Ignore Whitespace 刪所有空白／Token 連續空白合併為一個

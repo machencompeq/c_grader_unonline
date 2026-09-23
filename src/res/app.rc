@@ -1,0 +1,3 @@
+/* 讓視窗使用 Windows 新版外觀 (Common Controls v6) 並支援高 DPI；1 ICON = 視窗與工作列的圖示 */
+1 24 "app.manifest"
+1 ICON "app.ico"

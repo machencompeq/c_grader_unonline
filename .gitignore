@@ -1,0 +1,10 @@
+# 建置產物 (mingw32-make 會重新產生；Grader.exe 本身保留給老師直接使用)
+build/
+# 空資料夾 / 暫存
+docx/
+# 全班名單含真實學生姓名，不上傳；工具會自動重新產生
+名單.csv
+# 批改結果
+*_測資/reports/
+tests/fixtures/**/reports/
+result.csv

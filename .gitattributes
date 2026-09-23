@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.exe binary
+*.ico binary
+*.bat text eol=crlf

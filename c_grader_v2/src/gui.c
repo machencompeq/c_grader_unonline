@@ -69,6 +69,9 @@ enum {
     ID_AI_TOOL,
     ID_AI_PER_CHAR,
     ID_AI_MAX,
+    ID_AI_MIN,
+    ID_AI_MAX_CHARS,
+    ID_CE_FLOOR,
     ID_RE_ZERO,
     ID_VERIFY,
     ID_START,
@@ -107,7 +110,7 @@ typedef struct {
     HWND opt_trailing, opt_fullwidth, opt_case, opt_blank, opt_keywords;
     HWND mode[3];
     HWND per_char, n_chars, per_n, edit_rules, rule_summary;
-    HWND ai_fix, ai_tool, ai_per_char, ai_max, re_zero, ai_hint;
+    HWND ai_fix, ai_tool, ai_per_char, ai_max, ai_min, ai_max_chars, ce_floor, re_zero, ai_hint;
     HWND verify, start, export_csv, open_report, student_reports, detail, view_source;
     HWND progress, status, list, tooltip;
 
@@ -326,6 +329,9 @@ static void update_mode_controls(void)
     EnableWindow(app.ai_tool, idle && ai);
     EnableWindow(app.ai_per_char, idle && ai);
     EnableWindow(app.ai_max, idle && ai);
+    EnableWindow(app.ai_min, idle && ai);
+    EnableWindow(app.ai_max_chars, idle && ai);
+    EnableWindow(app.ce_floor, idle); /* 保底分不管有沒有 AI 都有效 */
 }
 
 static void refresh_template_match(void);
@@ -377,6 +383,9 @@ static void config_to_ui(const GradeConfig *cfg)
     select_ai_tool(cfg->ai_fix_tool);
     set_number(app.ai_per_char, cfg->ai_fix_penalty_per_char);
     set_number(app.ai_max, cfg->ai_fix_penalty_max);
+    set_number(app.ai_min, cfg->ai_fix_penalty_min_pct);
+    set_number(app.ai_max_chars, cfg->ai_fix_max_chars);
+    set_number(app.ce_floor, cfg->ce_score_floor_pct);
 
     set_number(app.full_score, cfg->full_score);
     set_number(app.timeout, cfg->timeout_ms / 1000.0);
@@ -464,6 +473,24 @@ static int ui_to_config(GradeConfig *cfg, const wchar_t **err)
         cfg->ai_fix_penalty_max = v;
     } else if (cfg->ai_fix) {
         *err = L"「修正扣分上限」請輸入 0 以上的數字 (0 = 不設上限)。";
+        return 0;
+    }
+    if (read_number(app.ai_min, &v) && v >= 0 && v <= 100) {
+        cfg->ai_fix_penalty_min_pct = v;
+    } else if (cfg->ai_fix) {
+        *err = L"「修正扣分最少扣滿分的 %」請輸入 0～100。";
+        return 0;
+    }
+    if (read_number(app.ai_max_chars, &v) && v >= 0 && v == (long)v) {
+        cfg->ai_fix_max_chars = (int)v;
+    } else if (cfg->ai_fix) {
+        *err = L"「AI 修改超過幾個字不採用」請輸入 0 以上的整數 (0 = 不限)。";
+        return 0;
+    }
+    if (read_number(app.ce_floor, &v) && v >= 0 && v <= 100) {
+        cfg->ce_score_floor_pct = v;
+    } else {
+        *err = L"「編譯失敗保底分」請輸入 0～100 (滿分的百分比)。";
         return 0;
     }
     return 1;
@@ -1174,7 +1201,7 @@ static void update_busy_ui(void)
     HWND idle_only[] = {app.students, app.browse_students, app.roster, app.problem, app.browse_problem,
                         app.edit_tests, app.template_combo, app.full_score, app.timeout,
                         app.cmp[0], app.cmp[1], app.cmp[2], app.opt_trailing, app.opt_fullwidth, app.opt_case,
-                        app.opt_blank, app.opt_keywords, app.mode[0], app.mode[1], app.mode[2], app.re_zero,
+                        app.opt_blank, app.opt_keywords, app.mode[0], app.mode[1], app.mode[2], app.re_zero, app.ce_floor,
                         app.ai_fix, app.verify, app.export_csv, app.open_report, app.student_reports};
     int idle = !app.busy;
     size_t i;
@@ -1264,7 +1291,7 @@ static void start_run(int verify_only)
             if (!ai_tool_find(cfg.ai_fix_tool, name, sizeof(name), command, sizeof(command))) {
                 if (MessageBoxW(app.wnd,
                                 L"已勾選「編譯失敗時交給本機 AI 做最小修正」，但這台電腦找不到 claude / codex / gemini "
-                                L"命令列工具。\n\n編譯失敗的學生會維持 Compile Error (0 分)。仍要開始批改嗎？",
+                                L"命令列工具。\n\n編譯失敗的學生會直接給保底分。仍要開始批改嗎？",
                                 L"找不到 AI 工具", MB_YESNO | MB_ICONWARNING) != IDYES)
                     goto done;
             }
@@ -1507,12 +1534,19 @@ static void create_tooltips(void)
                     L"含這些文字的整行不比對 (標準答案與學生輸出同樣處理)。多個關鍵字用 | 分隔，例如：請輸入|請依序");
     gui_add_tooltip(app.tooltip, app.ai_fix,
                     L"編譯失敗的學生：把原始碼與 gcc 錯誤訊息交給本機 AI 做最小修改，修得好就用修正後的程式執行測資。"
-                    L"總扣分 = 各題輸出扣分 + 修正扣分。找不到 AI 工具或修不好時，維持 Compile Error (0 分)。");
+                    L"總扣分 = 各題輸出扣分 + 修正扣分。找不到 AI 工具、修不好或改太多時，給編譯失敗保底分。");
     gui_add_tooltip(app.tooltip, app.ai_tool, L"auto = 依序找本機的 claude → codex → gemini 命令列工具。");
     gui_add_tooltip(app.tooltip, app.ai_per_char,
                     L"修正字元數 = 原始碼 → 修正後原始碼 的編輯距離 (中文字 = 1 CHAR)。修正扣分 = 修正字元數 × 這個數字。");
     gui_add_tooltip(app.tooltip, app.ai_max, L"修正扣分的上限；0 = 不另設上限 (最多仍只扣到滿分)。");
     gui_add_tooltip(app.tooltip, app.re_zero, L"不勾選時，程式當掉前已經印出的內容仍照常比對計分。");
+    gui_add_tooltip(app.tooltip, app.ai_min,
+                    L"AI 修好的學生至少扣滿分的這個百分比：沒有先編譯成功本身就有代價 (少一個分號也不會只扣 1 分)。");
+    gui_add_tooltip(app.tooltip, app.ai_max_chars,
+                    L"AI 修改超過這麼多字就不採用 (可能順手修好了邏輯)，改給保底分並在報告標示請老師確認。0 = 不限。");
+    gui_add_tooltip(app.tooltip, app.ce_floor,
+                    L"編譯失敗不會是 0 分：AI 修不好、改太多、找不到工具時給這個分數；AI 修好時修正扣分也不會把成績壓到這以下。"
+                    L"輸出本身就錯很多的學生，分數由輸出決定。");
     gui_add_tooltip(app.tooltip, app.verify, L"只編譯參考答案並執行所有測資，檢查標準答案是否合理，不批改學生。");
     gui_add_tooltip(app.tooltip, app.start, L"批改所有學生，並自動產生老師版與學生版 HTML 報告。");
 }
@@ -1596,7 +1630,7 @@ static void create_controls(HWND wnd)
     app.rule_summary = make_control(wnd, L"STATIC", L"", SS_LEFT, 0, 520, 222, 384, 60, ID_RULE_SUMMARY);
 
     /* 編譯失敗與執行異常 */
-    app.panel_ce = add_group(wnd, L"編譯失敗與執行異常的處理", 12, 300, 900, 84);
+    app.panel_ce = add_group(wnd, L"編譯失敗與執行異常的處理", 12, 300, 900, 112);
     app.ai_fix = add_check(wnd, L"編譯失敗時交給本機 AI 做最小修正後繼續批改", 24, 322, 300, ID_AI_FIX);
     add_label(wnd, L"工具", 332, 325, 34, 20);
     app.ai_tool = make_control(wnd, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP | WS_GROUP, 0,
@@ -1612,27 +1646,36 @@ static void create_controls(HWND wnd)
     add_label(wnd, L"分，上限", 644, 325, 58, 20);
     app.ai_max = add_edit(wnd, 704, 322, 44, ID_AI_MAX);
     add_label(wnd, L"分 (0 = 不設上限)", 754, 325, 140, 20);
-    app.re_zero = add_check(wnd, L"程式當掉 (Runtime Error) 的題目直接 0 分", 24, 352, 300, ID_RE_ZERO);
-    app.ai_hint = add_label(wnd, L"總扣分 = 各題輸出扣分 + 修正扣分 (最多扣到滿分)；找不到 AI 工具或修不好時維持 Compile Error 0 分。",
-                            332, 355, 570, 20);
+    add_label(wnd, L"修正扣分最少扣滿分的", 44, 353, 130, 20);
+    app.ai_min = add_edit(wnd, 176, 350, 40, ID_AI_MIN);
+    add_label(wnd, L"%", 220, 353, 16, 20);
+    add_label(wnd, L"AI 修改超過", 250, 353, 74, 20);
+    app.ai_max_chars = add_edit(wnd, 326, 350, 44, ID_AI_MAX_CHARS);
+    add_label(wnd, L"字就不採用", 376, 353, 76, 20);
+    add_label(wnd, L"編譯失敗保底：滿分的", 488, 353, 132, 20);
+    app.ce_floor = add_edit(wnd, 622, 350, 40, ID_CE_FLOOR);
+    add_label(wnd, L"% (CE 不會是 0 分)", 668, 353, 150, 20);
+    app.re_zero = add_check(wnd, L"程式當掉 (Runtime Error) 的題目直接 0 分", 24, 380, 300, ID_RE_ZERO);
+    app.ai_hint = add_label(wnd, L"總扣分 = 各題輸出扣分 + 修正扣分；AI 修不好、改太多或找不到工具時給保底分。",
+                            332, 383, 570, 20);
     gui_mark_muted(app.ai_hint);
     gui_mark_muted(app.rule_summary);
 
     /* 動作按鈕 */
-    app.verify = add_button(wnd, L"驗證參考答案", 12, 396, 112, 32, ID_VERIFY);
-    app.start = add_button(wnd, L"▶ 開始批改", 130, 396, 118, 32, ID_START);
+    app.verify = add_button(wnd, L"驗證參考答案", 12, 424, 112, 32, ID_VERIFY);
+    app.start = add_button(wnd, L"▶ 開始批改", 130, 424, 118, 32, ID_START);
     SendMessageW(app.start, WM_SETFONT, (WPARAM)g_bold_font, TRUE);
     gui_mark_primary(app.start);
-    app.export_csv = add_button(wnd, L"匯出 CSV", 254, 396, 90, 32, ID_EXPORT);
-    app.open_report = add_button(wnd, L"老師版報告", 350, 396, 96, 32, ID_OPEN_REPORT);
-    app.student_reports = add_button(wnd, L"學生版報告", 452, 396, 96, 32, ID_STUDENT_REPORTS);
-    app.detail = add_button(wnd, L"查看詳細", 554, 396, 84, 32, ID_DETAIL);
-    app.view_source = add_button(wnd, L"查看原始碼", 644, 396, 92, 32, ID_VIEW_SOURCE);
-    app.progress = make_control(wnd, PROGRESS_CLASSW, L"", PBS_SMOOTH, 0, 748, 403, 152, 18, ID_PROGRESS);
+    app.export_csv = add_button(wnd, L"匯出 CSV", 254, 424, 90, 32, ID_EXPORT);
+    app.open_report = add_button(wnd, L"老師版報告", 350, 424, 96, 32, ID_OPEN_REPORT);
+    app.student_reports = add_button(wnd, L"學生版報告", 452, 424, 96, 32, ID_STUDENT_REPORTS);
+    app.detail = add_button(wnd, L"查看詳細", 554, 424, 84, 32, ID_DETAIL);
+    app.view_source = add_button(wnd, L"查看原始碼", 644, 424, 92, 32, ID_VIEW_SOURCE);
+    app.progress = make_control(wnd, PROGRESS_CLASSW, L"", PBS_SMOOTH, 0, 748, 431, 152, 18, ID_PROGRESS);
 
     app.list = make_control(wnd, WC_LISTVIEWW, L"",
                             LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP | WS_GROUP, 0,
-                            12, 440, 900, 380, ID_LIST);
+                            12, 468, 900, 380, ID_LIST);
     ListView_SetExtendedListViewStyle(app.list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
     gui_style_listview(app.list);
     memset(&col, 0, sizeof(col));
@@ -1674,9 +1717,9 @@ static void layout(void)
     move_control(app.edit_tests, w - 100, 43, 88, 26);
     app.panels[app.panel_ce].rc.right = w - 12;
     InvalidateRect(app.wnd, NULL, TRUE);
-    move_control(app.ai_hint, 332, 355, w - 344, 20);
-    move_control(app.progress, 748, 403, w - 748 - 12, 18);
-    move_control(app.list, 12, 440, w - 24, h - 440 - status_h - 8);
+    move_control(app.ai_hint, 332, 383, w - 344, 20);
+    move_control(app.progress, 748, 431, w - 748 - 12, 18);
+    move_control(app.list, 12, 468, w - 24, h - 468 - status_h - 8);
 }
 
 /* 表格列顏色：全對 綠、編譯失敗 紅、AI 修正 藍、執行異常 黃 */
@@ -1748,7 +1791,7 @@ static LRESULT CALLBACK main_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_GETMINMAXINFO: {
         MINMAXINFO *mm = (MINMAXINFO *)lp;
-        RECT rc = {0, 0, dpi(940), dpi(640)};
+        RECT rc = {0, 0, dpi(940), dpi(668)};
         AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
         mm->ptMinTrackSize.x = rc.right - rc.left;
         mm->ptMinTrackSize.y = rc.bottom - rc.top;
@@ -1932,7 +1975,7 @@ int gui_run(HINSTANCE instance, int show)
     rc.left = 0;
     rc.top = 0;
     rc.right = dpi(960);
-    rc.bottom = dpi(860);
+    rc.bottom = dpi(888);
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
     CreateWindowExW(0, L"CGraderMain", L"C 語言作業批改工具", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT,
                     CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, instance, NULL);

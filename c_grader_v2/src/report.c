@@ -6,6 +6,7 @@
 
 #include "comparator.h"
 #include "config.h"
+#include "feedback.h"
 #include "report.h"
 
 /* 標示差異位置需要 n x m 的表格；超過這個大小就不標示 (差異數仍照常計算) */
@@ -483,12 +484,14 @@ void describe_settings(const GradeConfig *cfg, StrBuf *out)
     if (cfg->runtime_error_zero)
         sb_append(out, "｜程式當掉的題目 0 分");
     if (cfg->ai_fix) {
-        sb_appendf(out, "｜編譯失敗：本機 AI 最小修正後繼續批改，每修正 1 CHAR 扣 %g 分", cfg->ai_fix_penalty_per_char);
+        sb_appendf(out, "｜編譯失敗：本機 AI 最小修正後繼續批改，每修正 1 CHAR 扣 %g 分、最少扣滿分的 %g%%",
+                   cfg->ai_fix_penalty_per_char, cfg->ai_fix_penalty_min_pct);
         if (cfg->ai_fix_penalty_max > 0)
-            sb_appendf(out, " (上限 %g 分)", cfg->ai_fix_penalty_max);
-    } else {
-        sb_append(out, "｜編譯失敗：0 分");
+            sb_appendf(out, "、最多扣 %g 分", cfg->ai_fix_penalty_max);
+        if (cfg->ai_fix_max_chars > 0)
+            sb_appendf(out, "；AI 修改超過 %d 字不採用", cfg->ai_fix_max_chars);
     }
+    sb_appendf(out, "｜編譯失敗保底：滿分的 %g%%", cfg->ce_score_floor_pct);
 }
 
 /* ---------------- HTML ---------------- */
@@ -510,6 +513,9 @@ static const char *STYLE =
     ".AC{background:#dcf5dc;color:#17651f}.WA{background:#fdecc8;color:#8a5300}"
     ".RE,.TLE,.OLE,.CE,.NS{background:#fde0e0;color:#a31515}.CEF{background:#dbe7ff;color:#1a47a3}"
     ".note{background:#fff8db;border:1px solid #f0d77b;border-radius:8px;padding:8px 12px;margin:8px 0}"
+    ".fb{background:#eef6ff;border:1px solid #b9d6fb;border-left:4px solid #3b82f6;border-radius:8px;"
+    "padding:8px 14px;margin:8px 0}.fb b{color:#1e4f9a}.fb ul{margin:4px 0 2px;padding-left:20px}"
+    ".fb li{margin:2px 0}"
     "table{border-collapse:separate;border-spacing:0;width:100%;background:#fff;border:1px solid #dfe4ec;"
     "border-radius:10px;overflow:hidden}"
     "th,td{border-bottom:1px solid #e6eaf0;padding:7px 10px;text-align:left;vertical-align:top;font-size:14px}"
@@ -582,6 +588,39 @@ void report_file_name(const StudentResult *r, char *out, size_t size)
     snprintf(out, size, "%s.html", r->id);
 }
 
+/* 「哪裡錯了」方塊：text 是 feedback_* 產生的純文字，每行一條 */
+static void append_feedback_box(StrBuf *sb, const char *title, const char *text)
+{
+    const char *line = text;
+
+    if (text == NULL || text[0] == '\0')
+        return;
+    sb_append(sb, "<div class=fb><b>");
+    html_text(sb, title);
+    sb_append(sb, "</b><ul>");
+    while (*line != '\0') {
+        const char *end = strchr(line, '\n');
+        size_t len = end != NULL ? (size_t)(end - line) : strlen(line);
+        if (len > 0) {
+            sb_append(sb, "<li>");
+            html_escape(sb, line, len);
+            sb_append(sb, "</li>");
+        }
+        if (end == NULL)
+            break;
+        line = end + 1;
+    }
+    sb_append(sb, "</ul></div>");
+}
+
+static void append_compile_feedback(StrBuf *sb, const StudentResult *r)
+{
+    StrBuf text = {0};
+    feedback_compile_errors(r->compile_log, &text);
+    append_feedback_box(sb, "編譯錯誤說明 (白話)", text.data);
+    sb_free(&text);
+}
+
 static void append_source_file(StrBuf *sb, const char *path)
 {
     size_t len = 0;
@@ -626,13 +665,19 @@ static void append_fix_section(StrBuf *sb, const StudentResult *r)
     format_score(pen, sizeof(pen), r->fix_penalty);
 
     sb_append(sb, "<h2>編譯錯誤的 AI 自動修正</h2><div class=card>");
+    append_compile_feedback(sb, r);
     if (r->status == STUDENT_CE_FIXED) {
-        sb_appendf(sb, "<p>學生程式無法編譯。批改工具把原始碼與 gcc 錯誤訊息交給本機 AI (%s) 做「最小修改」，"
-                       "修正 <b>%ld</b> 個字元%s後可以編譯，<b>修正扣分 %s</b>；"
+        sb_appendf(sb, "<p>程式無法編譯。批改工具把原始碼與 gcc 錯誤訊息交給本機 AI (%s) 做「最小修改」，"
+                       "修正 <b>%ld</b> 個字元%s後可以編譯，<b>修正扣分 %s</b>%s；"
                        "之後用修正後的程式執行所有測資，各題的輸出扣分照常計算。</p>",
-                   r->fix_tool, r->fix_chars, r->fix_approximate ? " (近似值)" : "", pen);
+                   r->fix_tool, r->fix_chars, r->fix_approximate ? " (近似值)" : "", pen,
+                   r->ce_floor_applied ? " (已套用編譯失敗保底分，沒有再往下扣)" : "");
+    } else if (r->fix_rejected) {
+        sb_appendf(sb, "<p>程式無法編譯。AI 找到的修正改了 <b>%ld</b> 個字，超過上限，可能動到程式邏輯，所以<b>不採用</b>；"
+                       "成績為編譯失敗保底分，<b>請老師確認</b>。以下是 AI 的修正，供參考。</p>",
+                   r->fix_chars);
     } else {
-        sb_appendf(sb, "<p>學生程式無法編譯。本機 AI (%s) 嘗試修正 %d 次後仍然無法編譯，維持 Compile Error (0 分)。"
+        sb_appendf(sb, "<p>程式無法編譯。本機 AI (%s) 嘗試修正 %d 次後仍然無法編譯，成績為編譯失敗保底分。"
                        "以下是最後一次的嘗試，供老師參考。</p>",
                    r->fix_tool, r->fix_attempts);
     }
@@ -714,8 +759,8 @@ int report_write_student(const char *report_dir, const Grader *g, const StudentR
         else
             sb_appendf(&sb, "<span>總扣分 <b>%s</b></span></div>", deduction);
     } else if (r->status == STUDENT_COMPILE_ERROR) {
-        sb_append(&sb, "<p>編譯：<span class='pill CE'>Compile Error 編譯失敗</span>　所有題目 0 分 "
-                       "(錯誤訊息在下方)</p>");
+        sb_appendf(&sb, "<p>編譯：<span class='pill CE'>Compile Error 編譯失敗</span>　程式沒有執行，"
+                        "成績為編譯失敗保底分 %s 分 (錯誤說明在下方)</p>", score);
     } else {
         sb_append(&sb, "<p><span class='pill NS'>沒有 .c 檔</span>　資料夾裡找不到任何 C 原始碼，0 分</p>");
     }
@@ -733,9 +778,13 @@ int report_write_student(const char *report_dir, const Grader *g, const StudentR
     }
     sb_append(&sb, "</p></div>");
 
-    /* AI 修正對照 (修正成功，或嘗試過但失敗) */
-    if (r->fixed_source != NULL)
+    /* AI 修正對照 (修正成功，或嘗試過但失敗)；沒有 AI 修正的 CE 只給白話說明 */
+    if (r->fixed_source != NULL) {
         append_fix_section(&sb, r);
+    } else if (r->status == STUDENT_COMPILE_ERROR) {
+        sb_append(&sb, "<h2>哪裡錯了</h2>");
+        append_compile_feedback(&sb, r);
+    }
 
     /* 各題摘要 */
     if (student_ran_tests(r->status)) {
@@ -809,6 +858,17 @@ int report_write_student(const char *report_dir, const Grader *g, const StudentR
             else if (t->status == TEST_OUTPUT_LIMIT)
                 sb_append(&sb, "<br>輸出超過大小限制被強制結束，此題 0 分。");
             sb_append(&sb, "</p>");
+
+            /* 哪裡錯了 (白話)：隱藏測資的學生版只給錯誤類型，不透露內容 */
+            if (t->diff > 0 && t->actual != NULL) {
+                StrBuf fb = {0};
+                feedback_output(g->expected[i], exp_len, t->actual, t->actual_len,
+                                g->tests.items[i].hidden && for_student, &fb);
+                append_feedback_box(&sb, "哪裡錯了", fb.data);
+                sb_free(&fb);
+            } else if (t->actual == NULL && (t->status == TEST_WRONG || t->status == TEST_RUNTIME_ERROR)) {
+                append_feedback_box(&sb, "哪裡錯了", "程式沒有印出任何東西\n");
+            }
 
             /* 隱藏測資：學生版只顯示結果；老師版照常顯示全部內容 */
             if (g->tests.items[i].hidden) {

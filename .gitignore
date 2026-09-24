@@ -8,3 +8,5 @@ docx/
 *_測資/reports/
 tests/fixtures/**/reports/
 result.csv
+# AI 修正快取 (每位老師自己的批改資料)
+ai_fix_cache/

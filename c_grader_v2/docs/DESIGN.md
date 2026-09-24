@@ -29,6 +29,7 @@
 │ scorer.c      差異數 → 扣分；檢查區間規則 (重疊/空缺/最小>最大)                                 │
 │ config.c      設定預設值、grader.cfg 讀寫、評分模板、修正扣分                                   │
 │ ai_fix.c      找本機 AI CLI (claude/codex/gemini/自訂)、把提示詞送 stdin 取回 stdout、取出程式碼 │
+│ feedback.c    給學生的白話說明：逐行錯誤、常見錯誤類型、gcc 錯誤翻譯 (不呼叫 AI)             │
 │ roster.c      名單.csv：資料夾名稱 (拼音) → 中文姓名、學號                                       │
 │ util.c        路徑、UTF-8 ↔ 寬字元、讀檔 (可限制長度)、字串緩衝                                 │
 └──────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -77,8 +78,12 @@ StudentResult[] ─► 畫面表格、學生詳細、reports\*.html、result.csv
 - 規則檢查：重疊、最小 > 最大、負數、沒有規則 → 不能批改；空缺 (從 1 開始算) → 提醒 (空缺內扣光)
 - TLE / OLE → 該題 0 分；RE → 預設仍比對當掉前的輸出 (可設定直接 0 分)
 - RE 判斷：結束碼是 Windows 當機碼 (0xC0000005 等)；`return 1` 不算 RE
-- **CE 自動修正** (`ai_fix = 1`)：修正扣分 = min(修正字元數 × `ai_fix_penalty_per_char`, `ai_fix_penalty_max`)；
-  成績 = max(0, 各題得分總和 − 修正扣分)。找不到工具、超時、修 `ai_fix_attempts` 次仍失敗 → 維持 CE 0 分
+- **CE 自動修正** (`ai_fix = 1`)：修正扣分 = max(修正字元數 × `ai_fix_penalty_per_char`, 滿分 × `ai_fix_penalty_min_pct`%)，
+  再套用 `ai_fix_penalty_max`；成績 = max(各題得分總和 − 修正扣分, min(各題得分總和, 保底分))。
+- **CE 保底分** (`ce_score_floor_pct`，預設 10%)：找不到工具、超時、修 `ai_fix_attempts` 次仍失敗、
+  AI 修改超過 `ai_fix_max_chars` 字 (不採用，請老師確認) → 直接給保底分，不會是 0 分。
+- 修正結果以原始碼的 FNV-1a 雜湊存在 `測資資料夾\ai_fix_cache\`，重新批改結果不變。
+- **給學生的說明** (`feedback.c`)：由差異結果推導，不呼叫 AI；逐行列出錯誤、辨識常見錯誤類型、gcc 錯誤翻成白話。
 
 ## 5. 執行學生程式的安全措施 (executor.c)
 
@@ -96,7 +101,7 @@ StudentResult[] ─► 畫面表格、學生詳細、reports\*.html、result.csv
 
 ## 6. 測試
 
-`mingw32-make test` 執行 `tests/test_core.c` (814 項)：規格書的差異數例子、中文、換行、三種比對模式、
+`mingw32-make test` 執行 `tests/test_core.c` (855 項)：規格書的差異數例子、中文、換行、三種比對模式、
 所有比對選項、長輸出的帶狀精確與近似退回、三種評分模式的扣分、差異 0 不扣分、規則檢查、設定檔讀寫 (含值裡的 `#`)、
 每個模板、模板反查、名單學號推測、測資總表匯入匯出、AI 回答的程式碼擷取與提示詞、透過 cmd 走一趟 AI 呼叫、CSV 引號與公式防護、限制長度讀檔。
 

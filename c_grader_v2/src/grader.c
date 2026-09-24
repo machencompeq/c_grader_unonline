@@ -267,15 +267,44 @@ static int compile_with_fallbacks(const Grader *g, StringList *sources, const ch
     return ok;
 }
 
+/* ---------------- 編譯失敗的 AI 最小修正 ---------------- */
+
+/* 修正結果快取：測資資料夾\ai_fix_cache\<原始碼雜湊>.c (同一份原始碼重新批改時結果不變，也不必再問 AI) */
+static void fix_cache_path(const Grader *g, const char *source, size_t len, char *out, size_t size)
+{
+    unsigned long long h = 1469598103934665603ULL; /* FNV-1a 64 */
+    char dir[GRADER_PATH_MAX], name[40];
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        h ^= (unsigned char)source[i];
+        h *= 1099511628211ULL;
+    }
+    path_join(dir, sizeof(dir), g->problem_dir, "ai_fix_cache");
+    snprintf(name, sizeof(name), "%016llx.c", h);
+    path_join(out, size, dir, name);
+}
+
+static void fix_cache_store(const Grader *g, const char *path, const char *code)
+{
+    char dir[GRADER_PATH_MAX];
+    path_join(dir, sizeof(dir), g->problem_dir, "ai_fix_cache");
+    make_dir(dir);
+    write_file(path, code, strlen(code));
+}
+
 /*
  * 編譯失敗時的 AI 最小修正 (設定 ai_fix)：
- *   原始碼 + gcc 錯誤訊息 -> 本機 AI -> 修正後原始碼 -> 再編譯；仍失敗就把新錯誤再交給 AI (最多 attempts 次)。
+ *   (快取有就直接用) 原始碼 + gcc 錯誤訊息 -> 本機 AI -> 修正後原始碼 -> 再編譯；
+ *   仍失敗就把新錯誤再交給 AI (最多 attempts 次)。
  * 成功回傳 1：exe 已編好，r->fixed_source / fix_chars / fix_tool 填好，之後照常執行測資。
- * 失敗回傳 0 (維持 Compile Error)，原因寫進 r->note；最後一次的修正碼與錯誤留在 r->fixed_source / fix_log 供報告顯示。
+ * 失敗回傳 0 (維持 Compile Error，給保底分)，原因寫進 r->note；
+ * 最後一次的修正碼與錯誤留在 r->fixed_source / fix_log 供報告顯示。
+ * AI 修好但改超過 ai_fix_max_chars 個字：不採用 (可能順手修了邏輯)，fix_rejected = 1。
  */
 static int try_ai_fix(Grader *g, StudentResult *r, const char *work_dir, const char *exe, const char *ce_log)
 {
-    char *original, *current_source, *current_log, msg[600];
+    char *original, *current_source = NULL, *current_log = NULL, msg[600], cache_path[GRADER_PATH_MAX];
     size_t original_len = 0;
     const char *file_name;
     int attempt, ok = 0, ai_failed = 0;
@@ -286,16 +315,6 @@ static int try_ai_fix(Grader *g, StudentResult *r, const char *work_dir, const c
         append_note(r->note, sizeof(r->note), msg);
         return 0;
     }
-    if (!g->ai_checked) {
-        g->ai_checked = 1;
-        g->ai_available = ai_tool_find(g->cfg.ai_fix_tool, g->ai_tool, sizeof(g->ai_tool), g->ai_command,
-                                       sizeof(g->ai_command));
-    }
-    if (!g->ai_available) {
-        append_note(r->note, sizeof(r->note), "找不到本機 AI 工具 (claude / codex / gemini)，無法自動修正編譯錯誤");
-        return 0;
-    }
-
     original = read_file(r->sources.items[0], &original_len);
     if (original == NULL) {
         append_note(r->note, sizeof(r->note), "無法讀取原始碼，無法自動修正");
@@ -303,66 +322,117 @@ static int try_ai_fix(Grader *g, StudentResult *r, const char *work_dir, const c
     }
     original = text_to_utf8(original, &original_len); /* Big5 先轉 UTF-8，修正距離以字元計 */
     file_name = base_name(r->sources.items[0]);
-    snprintf(r->fix_tool, sizeof(r->fix_tool), "%s", g->ai_tool);
+    fix_cache_path(g, original, original_len, cache_path, sizeof(cache_path));
 
-    current_source = _strdup(original);
-    current_log = _strdup(ce_log != NULL ? ce_log : "");
-    for (attempt = 1; attempt <= g->cfg.ai_fix_attempts && !ok; attempt++) {
-        char *prompt = ai_fix_prompt(file_name, current_source, current_log, attempt);
-        char err[512], fixed_path[GRADER_PATH_MAX], fixed_name[64], *answer, *code;
-        StringList one = {0};
-        CompileResult fix_cr;
-
-        r->fix_attempts = attempt;
-        answer = ai_ask(g->ai_command, prompt, work_dir, g->cfg.ai_fix_timeout_ms, err, sizeof(err));
-        free(prompt);
-        if (answer == NULL) {
-            snprintf(msg, sizeof(msg), "AI (%s) 修正失敗：%s", g->ai_tool, err);
-            append_note(r->note, sizeof(r->note), msg);
-            ai_failed = 1;
-            break;
+    /* 1. 快取：上次修好的程式碼 */
+    if (g->cfg.ai_fix_cache && file_exists(cache_path)) {
+        char *cached = read_file(cache_path, NULL);
+        if (cached != NULL) {
+            StringList one = {0};
+            CompileResult fix_cr;
+            string_list_add(&one, cache_path);
+            compile_with_helper(g, g->cfg.compile_flags, &one, exe, work_dir, &fix_cr);
+            string_list_free(&one);
+            if (fix_cr.ok) {
+                current_source = cached;
+                current_log = fix_cr.log != NULL ? fix_cr.log : _strdup("");
+                ok = 1;
+                r->fix_cached = 1;
+                r->fix_attempts = 0;
+                snprintf(r->fix_tool, sizeof(r->fix_tool), "快取");
+            } else {
+                compile_result_free(&fix_cr);
+                free(cached);
+            }
         }
-        code = ai_extract_code(answer);
-        free(answer);
-        if (code == NULL) {
-            free(current_log);
-            current_log = _strdup("(AI 沒有回傳任何程式碼，請只輸出完整的 C 程式碼)");
-            continue;
-        }
-
-        snprintf(fixed_name, sizeof(fixed_name), "ai_fix_%d.c", attempt);
-        path_join(fixed_path, sizeof(fixed_path), work_dir, fixed_name);
-        write_file(fixed_path, code, strlen(code));
-        string_list_add(&one, fixed_path);
-        compile_with_helper(g, g->cfg.compile_flags, &one, exe, work_dir, &fix_cr);
-        string_list_free(&one);
-
-        free(current_source);
-        current_source = code;
-        free(current_log);
-        current_log = fix_cr.log != NULL ? fix_cr.log : _strdup("");
-        ok = fix_cr.ok;
     }
 
+    /* 2. 問 AI */
+    if (!ok) {
+        if (!g->ai_checked) {
+            g->ai_checked = 1;
+            g->ai_available = ai_tool_find(g->cfg.ai_fix_tool, g->ai_tool, sizeof(g->ai_tool), g->ai_command,
+                                           sizeof(g->ai_command));
+        }
+        if (!g->ai_available) {
+            append_note(r->note, sizeof(r->note), "找不到本機 AI 工具 (claude / codex / gemini)，無法自動修正編譯錯誤");
+            free(original);
+            return 0;
+        }
+        snprintf(r->fix_tool, sizeof(r->fix_tool), "%s", g->ai_tool);
+        current_source = _strdup(original);
+        current_log = _strdup(ce_log != NULL ? ce_log : "");
+        for (attempt = 1; attempt <= g->cfg.ai_fix_attempts && !ok; attempt++) {
+            char *prompt = ai_fix_prompt(file_name, current_source, current_log, attempt);
+            char err[512], fixed_path[GRADER_PATH_MAX], fixed_name[64], *answer, *code;
+            StringList one = {0};
+            CompileResult fix_cr;
+
+            r->fix_attempts = attempt;
+            answer = ai_ask(g->ai_command, prompt, work_dir, g->cfg.ai_fix_timeout_ms, err, sizeof(err));
+            free(prompt);
+            if (answer == NULL) {
+                snprintf(msg, sizeof(msg), "AI (%s) 修正失敗：%s", g->ai_tool, err);
+                append_note(r->note, sizeof(r->note), msg);
+                ai_failed = 1;
+                break;
+            }
+            code = ai_extract_code(answer);
+            free(answer);
+            if (code == NULL) {
+                free(current_log);
+                current_log = _strdup("(AI 沒有回傳任何程式碼，請只輸出完整的 C 程式碼)");
+                continue;
+            }
+
+            snprintf(fixed_name, sizeof(fixed_name), "ai_fix_%d.c", attempt);
+            path_join(fixed_path, sizeof(fixed_path), work_dir, fixed_name);
+            write_file(fixed_path, code, strlen(code));
+            string_list_add(&one, fixed_path);
+            compile_with_helper(g, g->cfg.compile_flags, &one, exe, work_dir, &fix_cr);
+            string_list_free(&one);
+
+            free(current_source);
+            current_source = code;
+            free(current_log);
+            current_log = fix_cr.log != NULL ? fix_cr.log : _strdup("");
+            ok = fix_cr.ok;
+        }
+        if (ok && g->cfg.ai_fix_cache)
+            fix_cache_store(g, cache_path, current_source);
+    }
+
+    /* 3. 修正字元數；改太多就不採用 */
     if (ok) {
         compare_options_default(&opts);
         opts.ignore_trailing_space = 1; /* CRLF/LF、行尾空白、檔尾換行不算修改 */
         r->fix_chars = compare_outputs(original, original_len, current_source, strlen(current_source), &opts,
                                        &r->fix_approximate);
-        if (r->fix_attempts > 1)
+        if (g->cfg.ai_fix_max_chars > 0 && r->fix_chars > g->cfg.ai_fix_max_chars) {
+            snprintf(msg, sizeof(msg), "AI 修改了 %ld 個字，超過上限 %d 個，可能動到邏輯，不採用；給編譯失敗保底分，請老師確認",
+                     r->fix_chars, g->cfg.ai_fix_max_chars);
+            append_note(r->note, sizeof(r->note), msg);
+            r->fix_rejected = 1;
+            ok = 0;
+        } else if (r->fix_cached) {
+            snprintf(msg, sizeof(msg), "編譯失敗，沿用上次 AI 的最小修正 (%ld 個字元) 後繼續批改", r->fix_chars);
+            append_note(r->note, sizeof(r->note), msg);
+        } else if (r->fix_attempts > 1) {
             snprintf(msg, sizeof(msg), "編譯失敗，AI (%s) 第 %d 次嘗試最小修正 %ld 個字元後可編譯，已繼續批改",
                      g->ai_tool, r->fix_attempts, r->fix_chars);
-        else
+            append_note(r->note, sizeof(r->note), msg);
+        } else {
             snprintf(msg, sizeof(msg), "編譯失敗，AI (%s) 最小修正 %ld 個字元後可編譯，已繼續批改", g->ai_tool,
                      r->fix_chars);
-        append_note(r->note, sizeof(r->note), msg);
+            append_note(r->note, sizeof(r->note), msg);
+        }
     } else if (!ai_failed) {
         snprintf(msg, sizeof(msg), "AI (%s) 嘗試修正 %d 次後仍無法編譯，維持 Compile Error", g->ai_tool,
                  r->fix_attempts);
         append_note(r->note, sizeof(r->note), msg);
     }
     /* 成功或失敗都保留最後一次的程式碼與訊息：老師可以在報告裡看到 AI 改了什麼 */
-    if (strcmp(current_source, original) != 0) {
+    if (current_source != NULL && strcmp(current_source, original) != 0) {
         r->fixed_source = current_source;
         r->fix_log = current_log;
     } else {
@@ -654,7 +724,18 @@ void grader_grade_student(Grader *g, int index, StudentResult *r)
     if (!cr.ok) {
         /* 編譯失敗：設定允許時交給本機 AI 做最小修正，修得好就用修正後的程式繼續批改 */
         if (!(g->cfg.ai_fix && try_ai_fix(g, r, work_dir, exe, cr.log))) {
+            /* 編譯失敗不會是 0 分：給保底分 */
+            double floor_score = config_ce_floor(&g->cfg);
             r->status = STUDENT_COMPILE_ERROR;
+            if (floor_score > 0) {
+                char msg[128], num[32];
+                format_score(num, sizeof(num), floor_score);
+                snprintf(msg, sizeof(msg), "編譯失敗保底 %s 分", num);
+                append_note(r->note, sizeof(r->note), msg);
+                r->score = floor_score;
+                r->total_deduction = g->cfg.full_score - floor_score;
+                r->ce_floor_applied = 1;
+            }
             return;
         }
         r->status = STUDENT_CE_FIXED;
@@ -750,10 +831,11 @@ void grader_grade_student(Grader *g, int index, StudentResult *r)
     if (i == r->test_count)
         r->total_diff = -1;
 
-    /* Step 3：AI 修正過的程式再扣「修正扣分」；總扣分 = 輸出扣分 + 修正扣分，成績最低 0 分 */
+    /* Step 3：AI 修正過的程式再扣「修正扣分」(有下限)；總扣分 = 輸出扣分 + 修正扣分，但不會低於保底分 */
     if (r->status == STUDENT_CE_FIXED) {
-        r->fix_penalty = config_fix_penalty(&g->cfg, r->fix_chars);
-        r->score = score_apply(r->score, r->fix_penalty);
+        double output_score = r->score;
+        r->score = config_ce_fixed_score(&g->cfg, output_score, r->fix_chars, &r->fix_penalty);
+        r->ce_floor_applied = r->fix_penalty + 1e-9 < config_fix_penalty(&g->cfg, r->fix_chars);
         r->total_deduction = g->cfg.full_score - r->score;
     }
 }

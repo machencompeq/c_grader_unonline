@@ -14,7 +14,7 @@
  *   --template <編號>      套用評分模板 (--list-templates 看編號)
  *   --csv <檔案>           匯出 CSV
  *   --no-report            不產生 HTML 比對報告 (預設會產生在 測資資料夾\reports\)
- *   --no-ai-fix            編譯失敗直接 0 分，不呼叫本機 AI 修正 (覆蓋設定檔的 ai_fix)
+ *   --no-ai-fix            編譯失敗直接給保底分，不呼叫本機 AI 修正 (覆蓋設定檔的 ai_fix)
  *   --ai-tool <名稱|命令>  指定 AI 工具：auto / claude / codex / gemini / 自訂命令列
  *   --tests-export <檔案>  把所有測資輸出成一份「總表」文字檔後結束 (方便整批修改)
  *   --tests-import <檔案>  用總表文字檔取代所有測資後結束 (AI 腳本的輸出也可以直接匯入)

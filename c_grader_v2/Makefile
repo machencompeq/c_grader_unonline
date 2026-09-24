@@ -11,7 +11,7 @@ WINDRES = windres
 CFLAGS = -std=gnu11 -Wall -Wextra -O2 -DUNICODE -D_UNICODE
 
 CORE = src/util.c src/executor.c src/compiler.c src/comparator.c src/scorer.c \
-       src/config.c src/testcase.c src/grader.c src/exporter.c src/report.c src/roster.c src/ai_fix.c
+       src/config.c src/testcase.c src/grader.c src/exporter.c src/report.c src/roster.c src/ai_fix.c src/feedback.c
 GUI = src/main.c src/gui.c src/gui_common.c src/gui_rules.c src/gui_detail.c src/gui_tests.c
 HEADERS = $(wildcard src/*.h)
 

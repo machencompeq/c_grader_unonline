@@ -12,6 +12,7 @@
 #include "../src/comparator.h"
 #include "../src/config.h"
 #include "../src/exporter.h"
+#include "../src/feedback.h"
 #include "../src/grader.h"
 #include "../src/roster.h"
 #include "../src/scorer.h"
@@ -579,6 +580,10 @@ static void test_config_roundtrip(void)
     a.ai_fix_penalty_max = 20;
     a.ai_fix_attempts = 3;
     a.ai_fix_timeout_ms = 90000;
+    a.ai_fix_penalty_min_pct = 15;
+    a.ai_fix_max_chars = 40;
+    a.ai_fix_cache = 0;
+    a.ce_score_floor_pct = 20;
     CHECK_LONG(config_save(path, &a), 1);
 
     config_default(&b);
@@ -599,6 +604,10 @@ static void test_config_roundtrip(void)
     CHECK_DOUBLE(b.ai_fix_penalty_max, 20);
     CHECK_LONG(b.ai_fix_attempts, 3);
     CHECK_LONG(b.ai_fix_timeout_ms, 90000);
+    CHECK_DOUBLE(b.ai_fix_penalty_min_pct, 15);
+    CHECK_LONG(b.ai_fix_max_chars, 40);
+    CHECK_LONG(b.ai_fix_cache, 0);
+    CHECK_DOUBLE(b.ce_score_floor_pct, 20);
     DeleteFileA(path);
 
     /* 值裡的 # 不是註解；行尾 (前面有空白) 的 # 才是 */
@@ -619,8 +628,9 @@ static void test_config_roundtrip(void)
         DeleteFileA(path);
     }
 
-    /* 修正扣分：每 CHAR x 上限 */
+    /* 修正扣分：每 CHAR x 上限 (下限設 0 時) */
     config_default(&a);
+    a.ai_fix_penalty_min_pct = 0;
     a.ai_fix_penalty_per_char = 2;
     a.ai_fix_penalty_max = 0;
     CHECK_DOUBLE(config_fix_penalty(&a, 0), 0);
@@ -629,6 +639,142 @@ static void test_config_roundtrip(void)
     a.ai_fix_penalty_max = 10;
     CHECK_DOUBLE(config_fix_penalty(&a, 7), 10);
     CHECK_DOUBLE(config_fix_penalty(&a, 3), 6);
+
+    /* 預設：每字 1 分、最少扣滿分的 10%、保底 10% */
+    config_default(&a);
+    CHECK_DOUBLE(a.ai_fix_penalty_min_pct, 10);
+    CHECK_LONG(a.ai_fix_max_chars, 30);
+    CHECK_DOUBLE(a.ce_score_floor_pct, 10);
+    CHECK_DOUBLE(config_fix_penalty(&a, 1), 10);   /* 少一個分號也扣 10，不是 1 */
+    CHECK_DOUBLE(config_fix_penalty(&a, 25), 25);  /* 超過下限就照字數 */
+    CHECK_DOUBLE(config_ce_floor(&a), 10);
+    a.full_score = 60;
+    CHECK_DOUBLE(config_fix_penalty(&a, 1), 6);    /* 下限跟著滿分走 */
+    CHECK_DOUBLE(config_ce_floor(&a), 6);
+    a.full_score = 100;
+
+    /* AI 修好後的成績：不會被修正扣分壓到保底分以下 */
+    {
+        double applied;
+        CHECK_DOUBLE(config_ce_fixed_score(&a, 100, 1, &applied), 90);  /* 輸出全對，扣下限 10 */
+        CHECK_DOUBLE(applied, 10);
+        CHECK_DOUBLE(config_ce_fixed_score(&a, 15, 1, &applied), 10);   /* 15 − 10 = 5 < 保底 10 -> 10 */
+        CHECK_DOUBLE(applied, 5);
+        CHECK_DOUBLE(config_ce_fixed_score(&a, 4, 1, &applied), 4);     /* 輸出本身只有 4 分：維持 4，不因 CE 變高 */
+        CHECK_DOUBLE(applied, 0);
+        CHECK_DOUBLE(config_ce_fixed_score(&a, 0, 1, &applied), 0);
+        a.ce_score_floor_pct = 0;
+        CHECK_DOUBLE(config_ce_fixed_score(&a, 15, 1, &applied), 5);    /* 保底 0 時照扣 */
+    }
+}
+
+static int has(const StrBuf *sb, const char *text)
+{
+    return sb->data != NULL && strstr(sb->data, text) != NULL;
+}
+
+static void test_feedback(void)
+{
+    StrBuf fb = {0};
+    const char *exp = "Sum: 150\nMax: 50\nAverage: 30.00\n";
+
+    /* 相同：沒有任何說明 */
+    feedback_output(exp, strlen(exp), exp, strlen(exp), 0, &fb);
+    CHECK_LONG(fb.len, 0);
+
+    /* 只差最後換行 */
+    {
+        const char *a = "Sum: 150\nMax: 50\nAverage: 30.00";
+        feedback_output(exp, strlen(exp), a, strlen(a), 0, &fb);
+    }
+    CHECK_LONG(has(&fb, "換行"), 1);
+    sb_free(&fb);
+
+    /* 全形冒號 */
+    {
+        const char *a = "Sum\xEF\xBC\x9A 150\nMax: 50\nAverage: 30.00\n";
+        feedback_output(exp, strlen(exp), a, strlen(a), 0, &fb);
+        CHECK_LONG(has(&fb, "全形"), 1);
+        sb_free(&fb);
+    }
+
+    /* 大小寫 */
+    {
+        const char *a = "sum: 150\nMax: 50\nAverage: 30.00\n";
+        feedback_output(exp, strlen(exp), a, strlen(a), 0, &fb);
+        CHECK_LONG(has(&fb, "大小寫"), 1);
+        sb_free(&fb);
+    }
+
+    /* 數字不同 -> 格式對、數字錯；並列出是哪一行 */
+    {
+        const char *a = "Sum: 150\nMax: 50\nAverage: 30\n";
+        feedback_output(exp, strlen(exp), a, strlen(a), 0, &fb);
+        CHECK_LONG(has(&fb, "數字不對") || has(&fb, "第 3 行"), 1);
+        CHECK_LONG(has(&fb, "第 3 行"), 1);
+        sb_free(&fb);
+    }
+    {
+        const char *a = "Sum: 151\nMax: 50\nAverage: 30.00\n";
+        feedback_output(exp, strlen(exp), a, strlen(a), 0, &fb);
+        CHECK_LONG(has(&fb, "數字不對"), 1);
+        CHECK_LONG(has(&fb, "第 1 行：應該是「Sum: 150」，你的輸出是「Sum: 151」"), 1);
+        CHECK_LONG(has(&fb, "從第 8 個字開始不同"), 1);
+        sb_free(&fb);
+    }
+
+    /* 打錯字：列出那一行 */
+    {
+        const char *a = "Sum: 150\nMax: 50\nAvg: 30.00\n";
+        feedback_output(exp, strlen(exp), a, strlen(a), 0, &fb);
+        CHECK_LONG(has(&fb, "第 3 行：應該是「Average: 30.00」，你的輸出是「Avg: 30.00」"), 1);
+        sb_free(&fb);
+    }
+
+    /* 少一行、多一行 */
+    {
+        const char *a = "Sum: 150\nAverage: 30.00\n";
+        feedback_output(exp, strlen(exp), a, strlen(a), 0, &fb);
+        CHECK_LONG(has(&fb, "少了第 2 行：「Max: 50」"), 1);
+        CHECK_LONG(has(&fb, "標準答案 3 行，你的輸出 2 行"), 1);
+        sb_free(&fb);
+        a = "debug\nSum: 150\nMax: 50\nAverage: 30.00\n";
+        feedback_output(exp, strlen(exp), a, strlen(a), 0, &fb);
+        CHECK_LONG(has(&fb, "你的第 1 行是多出來的：「debug」"), 1);
+        sb_free(&fb);
+    }
+
+    /* 隱藏測資：不透露內容 */
+    {
+        const char *a = "Sum: 150\nMax: 50\nAvg: 30.00\n";
+        feedback_output(exp, strlen(exp), a, strlen(a), 1, &fb);
+        CHECK_LONG(has(&fb, "Average"), 0);
+        CHECK_LONG(has(&fb, "Avg"), 0);
+        CHECK_LONG(fb.len > 0, 1);
+        sb_free(&fb);
+    }
+
+    /* 沒有輸出 */
+    feedback_output(exp, strlen(exp), "", 0, 0, &fb);
+    CHECK_LONG(has(&fb, "沒有印出任何東西"), 1);
+    sb_free(&fb);
+
+    /* gcc 錯誤翻成白話 (Windows 路徑含 C: 的冒號) */
+    {
+        const char *log =
+            "C:\\hw\\main.c: In function 'main':\n"
+            "C:\\hw\\main.c:2:28: error: expected ',' or ';' before 'printf'\n"
+            "    2 | int main(void) { int x = 1 printf(\"%d\\n\", x); return 0; }\n"
+            "C:\\hw\\main.c:5:5: error: 'totl' undeclared (first use in this function)\n"
+            "C:\\hw\\main.c:6:5: error: implicit declaration of function \xE2\x80\x98prinft\xE2\x80\x99\n"
+            "C:\\hw\\main.c:7:1: error: stray '\\343' in program\n";
+        feedback_compile_errors(log, &fb);
+        CHECK_LONG(has(&fb, "第 2 行：少了分號"), 1);
+        CHECK_LONG(has(&fb, "第 5 行：totl 沒有宣告"), 1);
+        CHECK_LONG(has(&fb, "第 6 行：函式 prinft 沒有宣告"), 1);
+        CHECK_LONG(has(&fb, "第 7 行：程式裡有不合法的字元"), 1);
+        sb_free(&fb);
+    }
 }
 
 static void test_ai_fix_helpers(void)
@@ -764,6 +910,7 @@ int main(void)
     test_ai_fix_helpers();
     test_status_and_csv();
     test_util();
+    test_feedback();
     printf("%d checks, %d failed\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

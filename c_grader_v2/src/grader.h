@@ -16,7 +16,8 @@
  *   grader_close(&g);
  *
  * 編譯失敗 (CE) 的學生：設定 ai_fix 開啟時，把原始碼 + gcc 錯誤訊息交給本機 AI 做最小修正 (ai_fix.c)，
- * 修正後照常執行測資；成績 = max(0, 各題得分總和 − 修正扣分)，修正扣分 = 修正字元數 × 每 CHAR 扣分。
+ * 修正後照常執行測資；成績 = max(各題得分總和 − 修正扣分, min(各題得分總和, 保底分))，
+ * 修正扣分 = max(修正字元數 × 每 CHAR 扣分, 下限)。修不好 / 改太多 / 沒有 AI 工具 -> 保底分 (不會是 0 分)。
  */
 #ifndef GRADER_H
 #define GRADER_H
@@ -87,6 +88,9 @@ typedef struct {
     double fix_penalty;  /* 修正扣分 */
     int fix_attempts;    /* AI 試了幾次 */
     char fix_tool[AI_TOOL_NAME_MAX]; /* 實際使用的工具 (claude / codex / gemini / 自訂) */
+    int fix_cached;      /* 1 = 沿用上次的修正 (快取) */
+    int fix_rejected;    /* 1 = AI 修好了但改太多字，不採用 (給保底分，請老師確認) */
+    int ce_floor_applied; /* 1 = 成績是編譯失敗保底分 (或被保底分擋住沒有再往下扣) */
 } StudentResult;
 
 typedef struct {

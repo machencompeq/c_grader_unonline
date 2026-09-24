@@ -49,18 +49,44 @@ void config_default(GradeConfig *cfg)
     cfg->ai_fix_penalty_max = 0;
     cfg->ai_fix_attempts = 2;
     cfg->ai_fix_timeout_ms = 180000;
+    cfg->ai_fix_penalty_min_pct = 10;
+    cfg->ai_fix_max_chars = 30;
+    cfg->ai_fix_cache = 1;
+    cfg->ce_score_floor_pct = 10;
 }
 
 double config_fix_penalty(const GradeConfig *cfg, long chars)
 {
-    double p;
+    double p, minimum = cfg->full_score * cfg->ai_fix_penalty_min_pct / 100.0;
 
-    if (chars <= 0)
+    if (chars < 0)
         return 0;
     p = chars * cfg->ai_fix_penalty_per_char;
+    if (p < minimum)
+        p = minimum;
     if (cfg->ai_fix_penalty_max > 0 && p > cfg->ai_fix_penalty_max)
         p = cfg->ai_fix_penalty_max;
     return p;
+}
+
+double config_ce_floor(const GradeConfig *cfg)
+{
+    double f = cfg->full_score * cfg->ce_score_floor_pct / 100.0;
+    return f < 0 ? 0 : f > cfg->full_score ? cfg->full_score : f;
+}
+
+double config_ce_fixed_score(const GradeConfig *cfg, double output_score, long chars, double *applied)
+{
+    double floor_score = config_ce_floor(cfg), low, score;
+
+    /* 修正扣分不能把成績壓到保底分以下；但輸出本身就低於保底分時維持輸出的分數 */
+    low = output_score < floor_score ? output_score : floor_score;
+    score = output_score - config_fix_penalty(cfg, chars);
+    if (score < low)
+        score = low;
+    if (applied != NULL)
+        *applied = output_score - score;
+    return score;
 }
 
 /* ---------------- 評分模板 ---------------- */
@@ -319,6 +345,14 @@ int config_load(const char *path, GradeConfig *cfg, char *err, size_t err_size)
             cfg->ai_fix_attempts = atoi(value);
         } else if (strcmp(key, "ai_fix_timeout_ms") == 0) {
             cfg->ai_fix_timeout_ms = atoi(value);
+        } else if (strcmp(key, "ai_fix_penalty_min_pct") == 0) {
+            cfg->ai_fix_penalty_min_pct = atof(value);
+        } else if (strcmp(key, "ai_fix_max_chars") == 0) {
+            cfg->ai_fix_max_chars = atoi(value);
+        } else if (strcmp(key, "ai_fix_cache") == 0) {
+            cfg->ai_fix_cache = parse_bool(value);
+        } else if (strcmp(key, "ce_score_floor_pct") == 0) {
+            cfg->ce_score_floor_pct = atof(value);
         } else {
             FAIL("第 %d 行：未知的設定項目 '%s'", line_no, key);
         }
@@ -342,6 +376,13 @@ int config_load(const char *path, GradeConfig *cfg, char *err, size_t err_size)
         snprintf(err, err_size, "ai_fix_penalty_per_char / ai_fix_penalty_max 不能是負數");
         return 0;
     }
+    if (cfg->ai_fix_penalty_min_pct < 0 || cfg->ai_fix_penalty_min_pct > 100 || cfg->ce_score_floor_pct < 0 ||
+        cfg->ce_score_floor_pct > 100) {
+        snprintf(err, err_size, "ai_fix_penalty_min_pct / ce_score_floor_pct 必須介於 0～100");
+        return 0;
+    }
+    if (cfg->ai_fix_max_chars < 0)
+        cfg->ai_fix_max_chars = 0;
     if (cfg->ai_fix_attempts < 1)
         cfg->ai_fix_attempts = 1;
     if (cfg->ai_fix_timeout_ms <= 0)
@@ -405,13 +446,18 @@ int config_save(const char *path, const GradeConfig *cfg)
     fprintf(f, "keep_temp = %d\n\n", cfg->keep_temp);
 
     fprintf(f, "# ---- 編譯失敗 (CE) 自動修正 ----\n");
-    fprintf(f, "ai_fix = %d                     # 1 = 呼叫本機 AI 做最小修正後繼續批改；0 = CE 直接 0 分\n",
+    fprintf(f, "ai_fix = %d                     # 1 = 呼叫本機 AI 做最小修正後繼續批改；0 = CE 直接給保底分\n",
             cfg->ai_fix);
     fprintf(f, "ai_fix_tool = %s             # auto / claude / codex / gemini / 自訂命令列\n", cfg->ai_fix_tool);
     fprintf(f, "ai_fix_penalty_per_char = %g    # 每修正 1 CHAR 扣幾分\n", cfg->ai_fix_penalty_per_char);
     fprintf(f, "ai_fix_penalty_max = %g         # 修正扣分上限 (0 = 不另設上限)\n", cfg->ai_fix_penalty_max);
     fprintf(f, "ai_fix_attempts = %d\n", cfg->ai_fix_attempts);
     fprintf(f, "ai_fix_timeout_ms = %d\n", cfg->ai_fix_timeout_ms);
+    fprintf(f, "ai_fix_penalty_min_pct = %g     # 修正扣分下限 (滿分的 %%)\n", cfg->ai_fix_penalty_min_pct);
+    fprintf(f, "ai_fix_max_chars = %d           # AI 修改超過這麼多字就不採用 (0 = 不限)\n", cfg->ai_fix_max_chars);
+    fprintf(f, "ai_fix_cache = %d                # 1 = 同一份原始碼沿用上次的修正\n", cfg->ai_fix_cache);
+    fprintf(f, "ce_score_floor_pct = %g         # 編譯失敗保底分 (滿分的 %%)，CE 不會被扣到 0 分\n",
+            cfg->ce_score_floor_pct);
 
     fclose(f);
     return 1;

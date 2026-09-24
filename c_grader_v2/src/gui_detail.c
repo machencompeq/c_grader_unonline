@@ -148,7 +148,7 @@ static void show_compile_log(HWND wnd)
     swprintf(title, 300, L"%ls 編譯訊息", id != NULL ? id : L"");
     free(id);
     sb_append(&sb, D.r->compile_log != NULL && D.r->compile_log[0] != '\0' ? D.r->compile_log : "(沒有任何編譯訊息)");
-    if (D.r->fixed_source != NULL) {
+    if (student_has_fix(D.r)) {
         sb_appendf(&sb, "\n\n==================== AI (%s) 修正後程式的 gcc 訊息 ====================\n", D.r->fix_tool);
         sb_append(&sb, D.r->fix_log != NULL && D.r->fix_log[0] != '\0' ? D.r->fix_log : "(沒有任何訊息，編譯成功)");
     }
@@ -174,7 +174,11 @@ static void show_fix(HWND wnd)
     else
         sb_appendf(&sb, "AI (%s) 嘗試修正 %d 次後仍無法編譯，維持 Compile Error。以下是最後一次的嘗試：\n\n",
                    D.r->fix_tool, D.r->fix_attempts);
-    sb_append(&sb, D.r->fixed_source != NULL ? D.r->fixed_source : "(沒有修正)");
+    {
+        char *fix = student_fix_text(D.r);
+        sb_append(&sb, fix);
+        free(fix);
+    }
     show_text_window(wnd, title, sb.data);
     sb_free(&sb);
 }
@@ -374,7 +378,7 @@ void detail_dialog(HWND owner, const Grader *g, const StudentResult *r, const ch
                              ID_D_COMPILE_LOG);
     D.fix_btn = make_control(wnd, L"BUTTON", L"查看 AI 修正", BS_PUSHBUTTON | WS_TABSTOP, 0, 138, 580, 120, 30,
                              ID_D_FIX);
-    EnableWindow(D.fix_btn, r->fixed_source != NULL);
+    EnableWindow(D.fix_btn, student_has_fix(r));
     D.report_btn = make_control(wnd, L"BUTTON", L"在瀏覽器開啟比對報告", BS_PUSHBUTTON | WS_TABSTOP, 0, 266, 580,
                                 170, 30, ID_D_OPEN_REPORT);
     snprintf(D.report_path, sizeof(D.report_path), "%s", report_path != NULL ? report_path : "");

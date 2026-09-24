@@ -79,7 +79,9 @@ StudentResult[] ─► 畫面表格、學生詳細、reports\*.html、result.csv
 - TLE / OLE → 該題 0 分；RE → 預設仍比對當掉前的輸出 (可設定直接 0 分)
 - RE 判斷：結束碼是 Windows 當機碼 (0xC0000005 等)；`return 1` 不算 RE
 - **CE 自動修正** (`ai_fix = 1`)：修正扣分 = max(修正字元數 × `ai_fix_penalty_per_char`, 滿分 × `ai_fix_penalty_min_pct`%)，
-  再套用 `ai_fix_penalty_max`；成績 = max(各題得分總和 − 修正扣分, min(各題得分總和, 保底分))。
+  再套用 `ai_fix_penalty_max`；成績 = max(各題得分總和 − 修正扣分, 保底分)，只要是 CE 一律保底。
+- 多個 .c：先一起編譯 (能編譯就不是 CE)；失敗時試單一檔案；仍失敗才交給 AI，只修 gcc 錯誤指到的檔案、其他不動，
+  再一起編譯；出現連結錯誤 (例如重複的 main) 時改用主程式 (main.c 或第一個有 main 的檔案)。修正字數為所有檔案加總。
 - **CE 保底分** (`ce_score_floor_pct`，預設 10%)：找不到工具、超時、修 `ai_fix_attempts` 次仍失敗、
   AI 修改超過 `ai_fix_max_chars` 字 (不採用，請老師確認) → 直接給保底分，不會是 0 分。
 - 修正結果以原始碼的 FNV-1a 雜湊存在 `測資資料夾\ai_fix_cache\`，重新批改結果不變。

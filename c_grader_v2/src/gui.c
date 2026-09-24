@@ -980,10 +980,12 @@ static void on_detail(void)
         sb_append(&sb, r->compile_log != NULL ? r->compile_log : "");
         if (r->note[0] != '\0')
             sb_appendf(&sb, "\n\n[批改工具] %s\n", r->note);
-        if (r->fixed_source != NULL) {
-            sb_appendf(&sb, "\n==================== AI (%s) 最後一次嘗試的修正 (仍無法編譯) ====================\n",
-                       r->fix_tool);
-            sb_append(&sb, r->fixed_source);
+        if (student_has_fix(r)) {
+            char *fix = student_fix_text(r);
+            sb_appendf(&sb, "\n==================== AI (%s) 的修正 (%s) ====================\n", r->fix_tool,
+                       r->fix_rejected ? "改太多，不採用" : "仍無法編譯");
+            sb_append(&sb, fix);
+            free(fix);
             if (r->fix_log != NULL && r->fix_log[0] != '\0')
                 sb_appendf(&sb, "\n---- 修正後的 gcc 訊息 ----\n%s", r->fix_log);
         }
@@ -1545,8 +1547,8 @@ static void create_tooltips(void)
     gui_add_tooltip(app.tooltip, app.ai_max_chars,
                     L"AI 修改超過這麼多字就不採用 (可能順手修好了邏輯)，改給保底分並在報告標示請老師確認。0 = 不限。");
     gui_add_tooltip(app.tooltip, app.ce_floor,
-                    L"編譯失敗不會是 0 分：AI 修不好、改太多、找不到工具時給這個分數；AI 修好時修正扣分也不會把成績壓到這以下。"
-                    L"輸出本身就錯很多的學生，分數由輸出決定。");
+                    L"只要是編譯失敗，成績一律不低於這個分數：AI 修不好、改太多、找不到工具時直接給這個分數；"
+                    L"AI 修好時，扣完修正扣分與輸出扣分後也不會低於這個分數。");
     gui_add_tooltip(app.tooltip, app.verify, L"只編譯參考答案並執行所有測資，檢查標準答案是否合理，不批改學生。");
     gui_add_tooltip(app.tooltip, app.start, L"批改所有學生，並自動產生老師版與學生版 HTML 報告。");
 }

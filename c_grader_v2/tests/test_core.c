@@ -660,9 +660,10 @@ static void test_config_roundtrip(void)
         CHECK_DOUBLE(applied, 10);
         CHECK_DOUBLE(config_ce_fixed_score(&a, 15, 1, &applied), 10);   /* 15 − 10 = 5 < 保底 10 -> 10 */
         CHECK_DOUBLE(applied, 5);
-        CHECK_DOUBLE(config_ce_fixed_score(&a, 4, 1, &applied), 4);     /* 輸出本身只有 4 分：維持 4，不因 CE 變高 */
+        CHECK_DOUBLE(config_ce_fixed_score(&a, 4, 1, &applied), 10);    /* 只要是 CE 一律保底：輸出 4 分也拉到 10 */
         CHECK_DOUBLE(applied, 0);
-        CHECK_DOUBLE(config_ce_fixed_score(&a, 0, 1, &applied), 0);
+        CHECK_DOUBLE(config_ce_fixed_score(&a, 0, 1, &applied), 10);
+        CHECK_DOUBLE(applied, 0);
         a.ce_score_floor_pct = 0;
         CHECK_DOUBLE(config_ce_fixed_score(&a, 15, 1, &applied), 5);    /* 保底 0 時照扣 */
     }

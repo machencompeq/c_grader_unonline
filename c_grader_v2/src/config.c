@@ -77,15 +77,14 @@ double config_ce_floor(const GradeConfig *cfg)
 
 double config_ce_fixed_score(const GradeConfig *cfg, double output_score, long chars, double *applied)
 {
-    double floor_score = config_ce_floor(cfg), low, score;
+    double floor_score = config_ce_floor(cfg), score;
 
-    /* 修正扣分不能把成績壓到保底分以下；但輸出本身就低於保底分時維持輸出的分數 */
-    low = output_score < floor_score ? output_score : floor_score;
+    /* 只要是 CE，成績一律不低於保底分 (輸出本身低於保底分也拉到保底分) */
     score = output_score - config_fix_penalty(cfg, chars);
-    if (score < low)
-        score = low;
+    if (score < floor_score)
+        score = floor_score;
     if (applied != NULL)
-        *applied = output_score - score;
+        *applied = output_score > score ? output_score - score : 0;
     return score;
 }
 

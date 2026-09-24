@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,6 +59,34 @@ const char *student_status_text(StudentStatus status)
     case STUDENT_NO_SOURCE:     return "沒有 .c 檔";
     }
     return "?";
+}
+
+static const char *base_name(const char *path);
+
+int student_has_fix(const StudentResult *r)
+{
+    int i;
+    for (i = 0; i < r->fixed_file_count; i++)
+        if (r->fixed_files[i] != NULL)
+            return 1;
+    return 0;
+}
+
+char *student_fix_text(const StudentResult *r)
+{
+    StrBuf sb = {0};
+    int i;
+    for (i = 0; i < r->fixed_file_count && i < r->sources.count; i++) {
+        if (r->fixed_files[i] == NULL)
+            continue;
+        if (r->fixed_file_count > 1)
+            sb_appendf(&sb, "%s==================== %s ====================\n", sb.len > 0 ? "\n" : "",
+                       base_name(r->sources.items[i]));
+        sb_append(&sb, r->fixed_files[i]);
+    }
+    if (sb.data == NULL)
+        sb_append(&sb, "(沒有修正)");
+    return sb.data;
 }
 
 int student_ran_tests(StudentStatus status)
@@ -269,7 +298,7 @@ static int compile_with_fallbacks(const Grader *g, StringList *sources, const ch
 
 /* ---------------- 編譯失敗的 AI 最小修正 ---------------- */
 
-/* 修正結果快取：測資資料夾\ai_fix_cache\<原始碼雜湊>.c (同一份原始碼重新批改時結果不變，也不必再問 AI) */
+/* 修正結果快取：測資資料夾\ai_fix_cache\<檔案內容雜湊>.c (同一份原始碼重新批改時結果不變，也不必再問 AI) */
 static void fix_cache_path(const Grader *g, const char *source, size_t len, char *out, size_t size)
 {
     unsigned long long h = 1469598103934665603ULL; /* FNV-1a 64 */
@@ -293,61 +322,217 @@ static void fix_cache_store(const Grader *g, const char *path, const char *code)
     write_file(path, code, strlen(code));
 }
 
-/*
- * 編譯失敗時的 AI 最小修正 (設定 ai_fix)：
- *   (快取有就直接用) 原始碼 + gcc 錯誤訊息 -> 本機 AI -> 修正後原始碼 -> 再編譯；
- *   仍失敗就把新錯誤再交給 AI (最多 attempts 次)。
- * 成功回傳 1：exe 已編好，r->fixed_source / fix_chars / fix_tool 填好，之後照常執行測資。
- * 失敗回傳 0 (維持 Compile Error，給保底分)，原因寫進 r->note；
- * 最後一次的修正碼與錯誤留在 r->fixed_source / fix_log 供報告顯示。
- * AI 修好但改超過 ai_fix_max_chars 個字：不採用 (可能順手修了邏輯)，fix_rejected = 1。
- */
-static int try_ai_fix(Grader *g, StudentResult *r, const char *work_dir, const char *exe, const char *ce_log)
+/* gcc 的錯誤訊息裡有沒有指到這個檔案 (gcc 會照我們傳入的路徑印出 "路徑:行:欄: error: ...") */
+static int log_has_error_in(const char *log, const char *path)
 {
-    char *original, *current_source = NULL, *current_log = NULL, msg[600], cache_path[GRADER_PATH_MAX];
-    size_t original_len = 0;
-    const char *file_name;
-    int attempt, ok = 0, ai_failed = 0;
+    size_t n = strlen(path);
+    const char *line = log;
+
+    while (line != NULL && *line != '\0') {
+        const char *end = strchr(line, '\n');
+        size_t len = end != NULL ? (size_t)(end - line) : strlen(line);
+        if (len > n && _strnicmp(line, path, n) == 0 && line[n] == ':') {
+            const char *e = strstr(line, ": error: ");
+            const char *f = strstr(line, ": fatal error: ");
+            if ((e != NULL && e < line + len) || (f != NULL && f < line + len))
+                return 1;
+        }
+        line = end != NULL ? end + 1 : NULL;
+    }
+    return 0;
+}
+
+/* 程式碼裡有沒有 main 函式 (粗略判斷：main 後面接著空白與左括號，前面不是英數字) */
+static int has_main(const char *text)
+{
+    const char *p = text;
+    while ((p = strstr(p, "main")) != NULL) {
+        const char *q = p + 4;
+        int before_ok = p == text || !(isalnum((unsigned char)p[-1]) || p[-1] == '_');
+        while (*q == ' ' || *q == '\t')
+            q++;
+        if (before_ok && *q == '(')
+            return 1;
+        p += 4;
+    }
+    return 0;
+}
+
+/* 多檔案時的主程式：先找 main.c，再找第一個有 main 函式的檔案，都沒有就用第一個 */
+static int main_candidate(const StringList *sources, char *const *texts)
+{
+    int i;
+    for (i = 0; i < sources->count; i++)
+        if (_stricmp(base_name(sources->items[i]), "main.c") == 0)
+            return i;
+    for (i = 0; i < sources->count; i++)
+        if (texts[i] != NULL && has_main(texts[i]))
+            return i;
+    return 0;
+}
+
+typedef struct {
+    int n;
+    char **orig;     /* 原始碼 (UTF-8) */
+    size_t *orig_len;
+    char **cur;      /* 目前版本 (可能已被 AI 修改) */
+    char (*path)[GRADER_PATH_MAX]; /* 目前版本寫在暫存資料夾的路徑 (交給 gcc) */
+    int *active;     /* 1 = 這個檔案參加編譯 */
+} FixFiles;
+
+static void fix_files_free(FixFiles *f)
+{
+    int i;
+    for (i = 0; i < f->n; i++) {
+        free(f->orig[i]);
+        free(f->cur[i]);
+    }
+    free(f->orig);
+    free(f->orig_len);
+    free(f->cur);
+    free(f->path);
+    free(f->active);
+    memset(f, 0, sizeof(*f));
+}
+
+static int fix_files_write(FixFiles *f, int i, const char *work_dir, const char *tag)
+{
+    char name[300];
+    snprintf(name, sizeof(name), "ai_%s_%d_%s", tag, i, "src.c");
+    path_join(f->path[i], GRADER_PATH_MAX, work_dir, name);
+    return write_file(f->path[i], f->cur[i], strlen(f->cur[i]));
+}
+
+static int fix_files_compile(const Grader *g, FixFiles *f, const char *exe, const char *work_dir, char **log)
+{
+    StringList list = {0};
+    CompileResult cr;
+    int i;
+
+    for (i = 0; i < f->n; i++)
+        if (f->active[i])
+            string_list_add(&list, f->path[i]);
+    compile_with_helper(g, g->cfg.compile_flags, &list, exe, work_dir, &cr);
+    string_list_free(&list);
+    free(*log);
+    *log = cr.log != NULL ? cr.log : _strdup("");
+    return cr.ok;
+}
+
+/* 目前的錯誤指到哪些檔案；沒有指到任何檔案 (連結錯誤) 時回傳 0 */
+static int fix_targets(const FixFiles *f, const char *log, int *target)
+{
+    int i, count = 0;
+    for (i = 0; i < f->n; i++) {
+        target[i] = f->active[i] && log_has_error_in(log, f->path[i]);
+        count += target[i];
+    }
+    return count;
+}
+
+/*
+ * 多檔案一起編譯時，錯誤沒有指到任何檔案 (連結錯誤，例如兩個檔案都有 main)：改成只用主程式那一個檔案。
+ * 有切換回傳 1 (並重新編譯)。
+ */
+static int switch_to_main(const Grader *g, const StudentResult *r, FixFiles *f, int *target, int *single,
+                          const char *exe, const char *work_dir, char **log, int *ok)
+{
+    int i, active = 0;
+
+    for (i = 0; i < f->n; i++)
+        active += f->active[i];
+    if (*ok || active <= 1 || fix_targets(f, *log, target) > 0)
+        return 0;
+    *single = main_candidate(&r->sources, f->cur);
+    for (i = 0; i < f->n; i++)
+        f->active[i] = i == *single;
+    *ok = fix_files_compile(g, f, exe, work_dir, log);
+    return 1;
+}
+
+/*
+ * 編譯失敗時的 AI 最小修正 (設定 ai_fix)，支援多個 .c 檔：
+ *   1. 每個檔案轉成 UTF-8 放進暫存資料夾，一起重新編譯，看 gcc 的錯誤指到哪些檔案。
+ *      錯誤沒有指到任何檔案 (例如兩個檔案都有 main 的連結錯誤) -> 改成只用主程式那一個檔案。
+ *   2. 有錯的檔案先查快取；沒有就逐一交給 AI 修，其他檔案原封不動，再一起編譯；仍失敗就帶著新錯誤再試。
+ * 成功回傳 1：exe 已編好；r->sources 換成實際使用的檔案，r->fixed_files 對應每個檔案的修正版 (沒改的是 NULL)。
+ * 失敗回傳 0 (維持 Compile Error，給保底分)，原因寫進 r->note；最後一次的修正留在 fixed_files 供報告顯示。
+ * AI 修好但總共改超過 ai_fix_max_chars 個字：不採用 (可能順手修了邏輯)，fix_rejected = 1。
+ */
+static int try_ai_fix(Grader *g, StudentResult *r, const char *work_dir, const char *exe)
+{
+    FixFiles f;
+    char *log = NULL, msg[600];
+    int *target = NULL, i, attempt, ok = 0, ai_failed = 0, changed = 0, single = -1;
     CompareOptions opts;
 
-    if (r->sources.count != 1) {
-        snprintf(msg, sizeof(msg), "有 %d 個 .c 檔，AI 自動修正只支援單一檔案", r->sources.count);
-        append_note(r->note, sizeof(r->note), msg);
+    memset(&f, 0, sizeof(f));
+    f.n = r->sources.count;
+    f.orig = calloc(f.n, sizeof(char *));
+    f.orig_len = calloc(f.n, sizeof(size_t));
+    f.cur = calloc(f.n, sizeof(char *));
+    f.path = calloc(f.n, sizeof(*f.path));
+    f.active = calloc(f.n, sizeof(int));
+    target = calloc(f.n, sizeof(int));
+    if (f.n == 0 || f.orig == NULL || f.orig_len == NULL || f.cur == NULL || f.path == NULL || f.active == NULL ||
+        target == NULL) {
+        fix_files_free(&f);
+        free(target);
         return 0;
     }
-    original = read_file(r->sources.items[0], &original_len);
-    if (original == NULL) {
-        append_note(r->note, sizeof(r->note), "無法讀取原始碼，無法自動修正");
-        return 0;
+    for (i = 0; i < f.n; i++) {
+        f.orig[i] = read_file(r->sources.items[i], &f.orig_len[i]);
+        if (f.orig[i] == NULL) {
+            append_note(r->note, sizeof(r->note), "無法讀取原始碼，無法自動修正");
+            fix_files_free(&f);
+            free(target);
+            return 0;
+        }
+        f.orig[i] = text_to_utf8(f.orig[i], &f.orig_len[i]); /* Big5 先轉 UTF-8，修正距離以字元計 */
+        f.cur[i] = _strdup(f.orig[i]);
+        f.active[i] = 1;
+        fix_files_write(&f, i, work_dir, "orig");
     }
-    original = text_to_utf8(original, &original_len); /* Big5 先轉 UTF-8，修正距離以字元計 */
-    file_name = base_name(r->sources.items[0]);
-    fix_cache_path(g, original, original_len, cache_path, sizeof(cache_path));
 
-    /* 1. 快取：上次修好的程式碼 */
-    if (g->cfg.ai_fix_cache && file_exists(cache_path)) {
-        char *cached = read_file(cache_path, NULL);
-        if (cached != NULL) {
-            StringList one = {0};
-            CompileResult fix_cr;
-            string_list_add(&one, cache_path);
-            compile_with_helper(g, g->cfg.compile_flags, &one, exe, work_dir, &fix_cr);
-            string_list_free(&one);
-            if (fix_cr.ok) {
-                current_source = cached;
-                current_log = fix_cr.log != NULL ? fix_cr.log : _strdup("");
-                ok = 1;
+    /* 1. 看錯誤指到哪些檔案；多檔案的連結錯誤 (例如兩個 main) 改成只用主程式 */
+    ok = fix_files_compile(g, &f, exe, work_dir, &log);
+    switch_to_main(g, r, &f, target, &single, exe, work_dir, &log, &ok);
+
+    /* 2. 快取：有錯的檔案用上次修好的版本 */
+    if (!ok && g->cfg.ai_fix_cache) {
+        int used = 0;
+        if (fix_targets(&f, log, target) == 0)
+            for (i = 0; i < f.n; i++)
+                target[i] = f.active[i];
+        for (i = 0; i < f.n; i++) {
+            char cache_path[GRADER_PATH_MAX], *cached;
+            if (!target[i])
+                continue;
+            fix_cache_path(g, f.orig[i], f.orig_len[i], cache_path, sizeof(cache_path));
+            if (file_exists(cache_path) && (cached = read_file(cache_path, NULL)) != NULL) {
+                free(f.cur[i]);
+                f.cur[i] = cached;
+                fix_files_write(&f, i, work_dir, "cache");
+                used = 1;
+            }
+        }
+        if (used) {
+            ok = fix_files_compile(g, &f, exe, work_dir, &log);
+            if (ok) {
                 r->fix_cached = 1;
-                r->fix_attempts = 0;
                 snprintf(r->fix_tool, sizeof(r->fix_tool), "快取");
-            } else {
-                compile_result_free(&fix_cr);
-                free(cached);
+            } else { /* 快取的版本編不過 (例如別的檔案變了)：回到原始碼，交給 AI */
+                for (i = 0; i < f.n; i++) {
+                    free(f.cur[i]);
+                    f.cur[i] = _strdup(f.orig[i]);
+                    fix_files_write(&f, i, work_dir, "orig");
+                }
+                fix_files_compile(g, &f, exe, work_dir, &log);
             }
         }
     }
 
-    /* 2. 問 AI */
+    /* 3. 問 AI：有錯的檔案逐一修正，其他檔案不動 */
     if (!ok) {
         if (!g->ai_checked) {
             g->ai_checked = 1;
@@ -356,58 +541,74 @@ static int try_ai_fix(Grader *g, StudentResult *r, const char *work_dir, const c
         }
         if (!g->ai_available) {
             append_note(r->note, sizeof(r->note), "找不到本機 AI 工具 (claude / codex / gemini)，無法自動修正編譯錯誤");
-            free(original);
+            fix_files_free(&f);
+            free(target);
+            free(log);
             return 0;
         }
         snprintf(r->fix_tool, sizeof(r->fix_tool), "%s", g->ai_tool);
-        current_source = _strdup(original);
-        current_log = _strdup(ce_log != NULL ? ce_log : "");
-        for (attempt = 1; attempt <= g->cfg.ai_fix_attempts && !ok; attempt++) {
-            char *prompt = ai_fix_prompt(file_name, current_source, current_log, attempt);
-            char err[512], fixed_path[GRADER_PATH_MAX], fixed_name[64], *answer, *code;
-            StringList one = {0};
-            CompileResult fix_cr;
-
+        for (attempt = 1; attempt <= g->cfg.ai_fix_attempts && !ok && !ai_failed; attempt++) {
+            char tag[32];
+            if (fix_targets(&f, log, target) == 0)
+                for (i = 0; i < f.n; i++)
+                    target[i] = f.active[i];
             r->fix_attempts = attempt;
-            answer = ai_ask(g->ai_command, prompt, work_dir, g->cfg.ai_fix_timeout_ms, err, sizeof(err));
-            free(prompt);
-            if (answer == NULL) {
-                snprintf(msg, sizeof(msg), "AI (%s) 修正失敗：%s", g->ai_tool, err);
-                append_note(r->note, sizeof(r->note), msg);
-                ai_failed = 1;
-                break;
+            snprintf(tag, sizeof(tag), "fix%d", attempt);
+            for (i = 0; i < f.n && !ai_failed; i++) {
+                char err[512], *prompt, *answer, *code;
+                if (!target[i])
+                    continue;
+                prompt = ai_fix_prompt(base_name(r->sources.items[i]), f.cur[i], log, attempt);
+                answer = ai_ask(g->ai_command, prompt, work_dir, g->cfg.ai_fix_timeout_ms, err, sizeof(err));
+                free(prompt);
+                if (answer == NULL) {
+                    snprintf(msg, sizeof(msg), "AI (%s) 修正失敗：%s", g->ai_tool, err);
+                    append_note(r->note, sizeof(r->note), msg);
+                    ai_failed = 1;
+                    break;
+                }
+                code = ai_extract_code(answer);
+                free(answer);
+                if (code == NULL)
+                    continue;
+                free(f.cur[i]);
+                f.cur[i] = code;
+                fix_files_write(&f, i, work_dir, tag);
             }
-            code = ai_extract_code(answer);
-            free(answer);
-            if (code == NULL) {
-                free(current_log);
-                current_log = _strdup("(AI 沒有回傳任何程式碼，請只輸出完整的 C 程式碼)");
-                continue;
+            if (!ai_failed) {
+                ok = fix_files_compile(g, &f, exe, work_dir, &log);
+                /* 修好語法後才出現的連結錯誤 (例如兩個檔案都有 main)：改用主程式，不另外算一次嘗試 */
+                switch_to_main(g, r, &f, target, &single, exe, work_dir, &log, &ok);
             }
-
-            snprintf(fixed_name, sizeof(fixed_name), "ai_fix_%d.c", attempt);
-            path_join(fixed_path, sizeof(fixed_path), work_dir, fixed_name);
-            write_file(fixed_path, code, strlen(code));
-            string_list_add(&one, fixed_path);
-            compile_with_helper(g, g->cfg.compile_flags, &one, exe, work_dir, &fix_cr);
-            string_list_free(&one);
-
-            free(current_source);
-            current_source = code;
-            free(current_log);
-            current_log = fix_cr.log != NULL ? fix_cr.log : _strdup("");
-            ok = fix_cr.ok;
         }
         if (ok && g->cfg.ai_fix_cache)
-            fix_cache_store(g, cache_path, current_source);
+            for (i = 0; i < f.n; i++)
+                if (f.active[i] && strcmp(f.cur[i], f.orig[i]) != 0) {
+                    char cache_path[GRADER_PATH_MAX];
+                    fix_cache_path(g, f.orig[i], f.orig_len[i], cache_path, sizeof(cache_path));
+                    fix_cache_store(g, cache_path, f.cur[i]);
+                }
     }
 
-    /* 3. 修正字元數；改太多就不採用 */
+    /* 4. 修正字元數 (所有檔案加總)；改太多就不採用 */
+    compare_options_default(&opts);
+    opts.ignore_trailing_space = 1; /* CRLF/LF、行尾空白、檔尾換行不算修改 */
+    r->fix_chars = 0;
+    for (i = 0; i < f.n; i++) {
+        int approx = 0;
+        if (!f.active[i] || strcmp(f.cur[i], f.orig[i]) == 0)
+            continue;
+        changed++;
+        r->fix_chars += compare_outputs(f.orig[i], f.orig_len[i], f.cur[i], strlen(f.cur[i]), &opts, &approx);
+        if (approx)
+            r->fix_approximate = 1;
+    }
+    if (single >= 0) {
+        snprintf(msg, sizeof(msg), "資料夾有 %d 個 .c，一起編譯有連結錯誤 (例如重複的 main)，以 %s 為主程式", f.n,
+                 base_name(r->sources.items[single]));
+        append_note(r->note, sizeof(r->note), msg);
+    }
     if (ok) {
-        compare_options_default(&opts);
-        opts.ignore_trailing_space = 1; /* CRLF/LF、行尾空白、檔尾換行不算修改 */
-        r->fix_chars = compare_outputs(original, original_len, current_source, strlen(current_source), &opts,
-                                       &r->fix_approximate);
         if (g->cfg.ai_fix_max_chars > 0 && r->fix_chars > g->cfg.ai_fix_max_chars) {
             snprintf(msg, sizeof(msg), "AI 修改了 %ld 個字，超過上限 %d 個，可能動到邏輯，不採用；給編譯失敗保底分，請老師確認",
                      r->fix_chars, g->cfg.ai_fix_max_chars);
@@ -417,29 +618,50 @@ static int try_ai_fix(Grader *g, StudentResult *r, const char *work_dir, const c
         } else if (r->fix_cached) {
             snprintf(msg, sizeof(msg), "編譯失敗，沿用上次 AI 的最小修正 (%ld 個字元) 後繼續批改", r->fix_chars);
             append_note(r->note, sizeof(r->note), msg);
-        } else if (r->fix_attempts > 1) {
-            snprintf(msg, sizeof(msg), "編譯失敗，AI (%s) 第 %d 次嘗試最小修正 %ld 個字元後可編譯，已繼續批改",
-                     g->ai_tool, r->fix_attempts, r->fix_chars);
-            append_note(r->note, sizeof(r->note), msg);
         } else {
-            snprintf(msg, sizeof(msg), "編譯失敗，AI (%s) 最小修正 %ld 個字元後可編譯，已繼續批改", g->ai_tool,
-                     r->fix_chars);
+            char files[256] = "";
+            for (i = 0; i < f.n; i++)
+                if (f.active[i] && strcmp(f.cur[i], f.orig[i]) != 0 && f.n > 1) {
+                    size_t len = strlen(files);
+                    snprintf(files + len, sizeof(files) - len, "%s%s", len > 0 ? "、" : "", base_name(r->sources.items[i]));
+                }
+            snprintf(msg, sizeof(msg), "編譯失敗，AI (%s)%s%s%s 最小修正 %ld 個字元後可編譯，已繼續批改", g->ai_tool,
+                     r->fix_attempts > 1 ? " 多次嘗試後" : "", files[0] != '\0' ? " 修正 " : "", files, r->fix_chars);
             append_note(r->note, sizeof(r->note), msg);
         }
-    } else if (!ai_failed) {
-        snprintf(msg, sizeof(msg), "AI (%s) 嘗試修正 %d 次後仍無法編譯，維持 Compile Error", g->ai_tool,
+    } else if (!ai_failed && !r->fix_rejected) {
+        snprintf(msg, sizeof(msg), "AI (%s) 嘗試修正 %d 次後仍無法編譯，維持 Compile Error", r->fix_tool,
                  r->fix_attempts);
         append_note(r->note, sizeof(r->note), msg);
     }
-    /* 成功或失敗都保留最後一次的程式碼與訊息：老師可以在報告裡看到 AI 改了什麼 */
-    if (current_source != NULL && strcmp(current_source, original) != 0) {
-        r->fixed_source = current_source;
-        r->fix_log = current_log;
-    } else {
-        free(current_source);
-        free(current_log);
+
+    /* 5. 保留修正結果給報告：成功時 sources 換成實際參加編譯的檔案 */
+    if (changed > 0 || (ok && single >= 0)) {
+        StringList used = {0};
+        int k = 0;
+        for (i = 0; i < f.n; i++)
+            if (f.active[i])
+                k++;
+        r->fixed_files = calloc(k > 0 ? k : 1, sizeof(char *));
+        r->fixed_file_count = k;
+        for (i = 0, k = 0; i < f.n; i++) {
+            if (!f.active[i])
+                continue;
+            string_list_add(&used, r->sources.items[i]);
+            if (r->fixed_files != NULL && strcmp(f.cur[i], f.orig[i]) != 0) {
+                r->fixed_files[k] = f.cur[i];
+                f.cur[i] = NULL;
+            }
+            k++;
+        }
+        string_list_free(&r->sources);
+        r->sources = used;
+        r->fix_log = log;
+        log = NULL;
     }
-    free(original);
+    fix_files_free(&f);
+    free(target);
+    free(log);
     return ok;
 }
 
@@ -723,7 +945,7 @@ void grader_grade_student(Grader *g, int index, StudentResult *r)
     r->compile_log = cr.log;
     if (!cr.ok) {
         /* 編譯失敗：設定允許時交給本機 AI 做最小修正，修得好就用修正後的程式繼續批改 */
-        if (!(g->cfg.ai_fix && try_ai_fix(g, r, work_dir, exe, cr.log))) {
+        if (!(g->cfg.ai_fix && try_ai_fix(g, r, work_dir, exe))) {
             /* 編譯失敗不會是 0 分：給保底分 */
             double floor_score = config_ce_floor(&g->cfg);
             r->status = STUDENT_COMPILE_ERROR;
@@ -835,7 +1057,8 @@ void grader_grade_student(Grader *g, int index, StudentResult *r)
     if (r->status == STUDENT_CE_FIXED) {
         double output_score = r->score;
         r->score = config_ce_fixed_score(&g->cfg, output_score, r->fix_chars, &r->fix_penalty);
-        r->ce_floor_applied = r->fix_penalty + 1e-9 < config_fix_penalty(&g->cfg, r->fix_chars);
+        r->ce_floor_applied = r->score + 1e-9 >= config_ce_floor(&g->cfg) &&
+                              r->fix_penalty + 1e-9 < config_fix_penalty(&g->cfg, r->fix_chars);
         r->total_deduction = g->cfg.full_score - r->score;
     }
 }
@@ -880,7 +1103,9 @@ void student_result_free(StudentResult *r)
         free(r->tests[i].actual);
     free(r->tests);
     free(r->compile_log);
-    free(r->fixed_source);
+    for (i = 0; i < r->fixed_file_count; i++)
+        free(r->fixed_files[i]);
+    free(r->fixed_files);
     free(r->fix_log);
     string_list_free(&r->sources);
     memset(r, 0, sizeof(*r));

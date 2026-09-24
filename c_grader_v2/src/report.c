@@ -654,14 +654,9 @@ static void append_source_file(StrBuf *sb, const char *path)
 /* 編譯失敗的 AI 修正：原始碼 vs 修正後 左右對照 (沿用輸出比對的標示器) */
 static void append_fix_section(StrBuf *sb, const StudentResult *r)
 {
-    size_t orig_len = 0;
-    char *orig = r->sources.count > 0 ? read_file(r->sources.items[0], &orig_len) : NULL;
-    MarkedText a, b;
     char pen[32];
-    int marked;
+    int i;
 
-    if (orig != NULL)
-        orig = text_to_utf8(orig, &orig_len);
     format_score(pen, sizeof(pen), r->fix_penalty);
 
     sb_append(sb, "<h2>編譯錯誤的 AI 自動修正</h2><div class=card>");
@@ -671,7 +666,7 @@ static void append_fix_section(StrBuf *sb, const StudentResult *r)
                        "修正 <b>%ld</b> 個字元%s後可以編譯，<b>修正扣分 %s</b>%s；"
                        "之後用修正後的程式執行所有測資，各題的輸出扣分照常計算。</p>",
                    r->fix_tool, r->fix_chars, r->fix_approximate ? " (近似值)" : "", pen,
-                   r->ce_floor_applied ? " (已套用編譯失敗保底分，沒有再往下扣)" : "");
+                   r->ce_floor_applied ? " (已套用編譯失敗保底分)" : "");
     } else if (r->fix_rejected) {
         sb_appendf(sb, "<p>程式無法編譯。AI 找到的修正改了 <b>%ld</b> 個字，超過上限，可能動到程式邏輯，所以<b>不採用</b>；"
                        "成績為編譯失敗保底分，<b>請老師確認</b>。以下是 AI 的修正，供參考。</p>",
@@ -685,13 +680,32 @@ static void append_fix_section(StrBuf *sb, const StudentResult *r)
     html_text(sb, r->compile_log != NULL ? r->compile_log : "");
     sb_append(sb, "</pre></details>");
 
-    decode(orig != NULL ? orig : "", orig != NULL ? orig_len : 0, &a);
-    decode(r->fixed_source, strlen(r->fixed_source), &b);
     sb_append(sb, "<p class='muted legend'>標示說明：<mark class=miss>紅色刪除線</mark> = 原始碼中被 AI 刪除或改掉的字；"
                   "<mark class=extra>綠色</mark> = AI 新增或改成的字。空白顯示為 ·、Tab 為 →、換行為 ↵。</p>");
-    marked = render_diff_views(sb, &a, &b, "學生原始碼", "AI 修正後", NULL, NULL, 0, 0);
-    if (!marked)
-        sb_append(sb, "<p class=muted>程式太長，未標示差異位置。</p>");
+    for (i = 0; i < r->fixed_file_count && i < r->sources.count; i++) {
+        size_t orig_len = 0;
+        char *orig;
+        MarkedText a, b;
+        const char *name = strrchr(r->sources.items[i], '\\');
+
+        if (r->fixed_files[i] == NULL)
+            continue;
+        orig = read_file(r->sources.items[i], &orig_len);
+        if (orig != NULL)
+            orig = text_to_utf8(orig, &orig_len);
+        if (r->sources.count > 1) {
+            sb_append(sb, "<h3>");
+            html_text(sb, name != NULL ? name + 1 : r->sources.items[i]);
+            sb_append(sb, "</h3>");
+        }
+        decode(orig != NULL ? orig : "", orig != NULL ? orig_len : 0, &a);
+        decode(r->fixed_files[i], strlen(r->fixed_files[i]), &b);
+        if (!render_diff_views(sb, &a, &b, "學生原始碼", "AI 修正後", NULL, NULL, 0, 0))
+            sb_append(sb, "<p class=muted>程式太長，未標示差異位置。</p>");
+        marked_free(&a);
+        marked_free(&b);
+        free(orig);
+    }
     if (r->fix_log != NULL && r->fix_log[0] != '\0') {
         sb_appendf(sb, "<details><summary>%s</summary><pre>",
                    r->status == STUDENT_CE_FIXED ? "修正後程式的 gcc 訊息 (警告)" : "修正後仍然失敗的 gcc 錯誤訊息");
@@ -699,9 +713,6 @@ static void append_fix_section(StrBuf *sb, const StudentResult *r)
         sb_append(sb, "</pre></details>");
     }
     sb_append(sb, "</div>");
-    marked_free(&a);
-    marked_free(&b);
-    free(orig);
 }
 
 int report_write_student(const char *report_dir, const Grader *g, const StudentResult *r, ReportAudience audience,
@@ -779,7 +790,7 @@ int report_write_student(const char *report_dir, const Grader *g, const StudentR
     sb_append(&sb, "</p></div>");
 
     /* AI 修正對照 (修正成功，或嘗試過但失敗)；沒有 AI 修正的 CE 只給白話說明 */
-    if (r->fixed_source != NULL) {
+    if (student_has_fix(r)) {
         append_fix_section(&sb, r);
     } else if (r->status == STUDENT_COMPILE_ERROR) {
         sb_append(&sb, "<h2>哪裡錯了</h2>");
@@ -910,7 +921,7 @@ int report_write_student(const char *report_dir, const Grader *g, const StudentR
             append_source_file(&sb, r->sources.items[i]);
         sb_append(&sb, "</div>");
     }
-    if (r->fixed_source == NULL && r->compile_log != NULL && r->compile_log[0] != '\0') {
+    if (!student_has_fix(r) && r->compile_log != NULL && r->compile_log[0] != '\0') {
         sb_appendf(&sb, "<h2>%s</h2><pre>", r->status == STUDENT_COMPILE_ERROR ? "編譯錯誤 (gcc)" : "編譯警告 (gcc)");
         html_text(&sb, r->compile_log);
         sb_append(&sb, "</pre>");

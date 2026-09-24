@@ -16,7 +16,7 @@
  *   grader_close(&g);
  *
  * 編譯失敗 (CE) 的學生：設定 ai_fix 開啟時，把原始碼 + gcc 錯誤訊息交給本機 AI 做最小修正 (ai_fix.c)，
- * 修正後照常執行測資；成績 = max(各題得分總和 − 修正扣分, min(各題得分總和, 保底分))，
+ * 修正後照常執行測資；成績 = max(各題得分總和 − 修正扣分, 保底分)，
  * 修正扣分 = max(修正字元數 × 每 CHAR 扣分, 下限)。修不好 / 改太多 / 沒有 AI 工具 -> 保底分 (不會是 0 分)。
  */
 #ifndef GRADER_H
@@ -81,7 +81,8 @@ typedef struct {
     double score;
 
     /* 編譯失敗的 AI 最小修正 (status == STUDENT_CE_FIXED 才會計分；CE 時若有嘗試也會留下最後一次的結果) */
-    char *fixed_source;  /* 修正後原始碼 (UTF-8)，NULL = 沒有嘗試 */
+    char **fixed_files;  /* 每個檔案修正後的原始碼 (UTF-8)，與 sources 對應；NULL = 這個檔案沒改 */
+    int fixed_file_count;
     char *fix_log;       /* 修正後程式的 gcc 訊息 */
     long fix_chars;      /* 修正字元數 (原始碼 -> 修正後 的編輯距離)，-1 = 沒有修正 */
     int fix_approximate;
@@ -172,5 +173,10 @@ const char *test_status_name(TestStatus status);  /* "AC" "WA" "RE" "TLE" "OLE" 
 const char *test_status_text(TestStatus status);  /* 中文說明 */
 const char *student_status_name(StudentStatus status); /* "OK" "CE Fixed" "Compile Error" "No Source" */
 const char *student_status_text(StudentStatus status); /* 中文：「OK」「CE→AI 修正」「編譯失敗」「沒有 .c 檔」 */
+
+/* 有沒有 AI 修正過的檔案 (修好、或嘗試後失敗但留下最後一次的修正) */
+int student_has_fix(const StudentResult *r);
+/* 修正後的程式碼 (多個檔案時每個檔案加標題)，malloc 的字串 */
+char *student_fix_text(const StudentResult *r);
 
 #endif

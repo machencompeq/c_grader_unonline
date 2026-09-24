@@ -93,23 +93,30 @@ void gui_mark_muted(HWND label)
 
 LRESULT gui_theme_ctlcolor(UINT msg, HDC dc, HWND control)
 {
-    SetBkMode(dc, TRANSPARENT);
+    /*
+     * Edit / ListBox 必須用不透明背景 (OPAQUE)：Edit 刪字、捲動時只重畫那一行文字，
+     * 透明背景不會蓋掉舊字，按 Backspace 就會留下殘影。
+     */
     switch (msg) {
     case WM_CTLCOLOREDIT:
     case WM_CTLCOLORLISTBOX:
+        SetBkMode(dc, OPAQUE);
         SetTextColor(dc, g_theme.text);
         SetBkColor(dc, g_theme.field);
         return (LRESULT)br_field;
     case WM_CTLCOLORSTATIC:
         if (is_class(control, L"EDIT")) { /* 唯讀 Edit 也走這裡 */
+            SetBkMode(dc, OPAQUE);
             SetTextColor(dc, g_theme.text);
             SetBkColor(dc, g_theme.field);
             return (LRESULT)br_field;
         }
+        SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, GetPropW(control, L"cg_muted") != NULL ? g_theme.muted : g_theme.text);
         SetBkColor(dc, g_theme.bg);
         return (LRESULT)br_bg;
     default:
+        SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, g_theme.text);
         SetBkColor(dc, g_theme.bg);
         return (LRESULT)br_bg;
